@@ -1,0 +1,17 @@
+{
+  "name": "video-watch",
+  "description": "video-watch: let AI coding agents watch videos locally (transcript, sound map, frames).",
+  "owner": {
+    "name": "AAyberk",
+    "url": "https://github.com/AAyberkU"
+  },
+  "plugins": [
+    {
+      "name": "video-watch",
+      "source": "./",
+      "description": "Watch videos locally: transcript (subtitles or local Whisper), an optional sound map, and timestamped frames from YouTube, TikTok, Instagram, X, any yt-dlp site, and local files.",
+      "category": "productivity",
+      "tags": ["video", "transcript", "whisper", "youtube"]
+    }
+  ]
+}

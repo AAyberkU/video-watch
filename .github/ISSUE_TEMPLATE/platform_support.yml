@@ -1,0 +1,66 @@
+name: Platform support report
+description: Report how video-watch runs on your OS, GPU or agent (especially macOS, AMD, Intel, OpenCode, Kilo).
+labels: ["platform"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Reports from hardware the maintainer cannot test are very valuable, even when everything works.
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: GPU / CPU and driver
+      description: For example "AMD RX 7800 XT, Adrenalin 25.x", "Apple M3 Pro 18 GB", "Intel Arc A770".
+    validations:
+      required: true
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Agent
+      options:
+        - Claude Code
+        - Codex
+        - OpenCode
+        - Kilo
+        - Other / CLI only
+  - type: textarea
+    id: doctor
+    attributes:
+      label: doctor output
+      description: Output of `uv run --no-project --python ">=3.11" python <skill folder>/scripts/video_watch.py doctor` (remove personal paths if you like).
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What worked and what did not?
+      description: |
+        For example: fetch with CPU mode (model, video length, time taken), frames, the sound map, and
+        whether your agent could read the frame images.
+    validations:
+      required: true
+  - type: textarea
+    id: ideas
+    attributes:
+      label: Ideas for supporting this platform
+      description: Engines or libraries you know work here (for example MLX, whisper.cpp with Metal or Vulkan, ROCm).
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Contribution
+      options:
+        - label: I can test changes on this hardware.
+        - label: I would like to implement support.

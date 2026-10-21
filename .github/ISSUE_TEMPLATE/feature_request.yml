@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest an improvement or a new capability.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check the [roadmap](https://github.com/AAyberkU/video-watch/blob/main/ROADMAP.md) first;
+        some ideas are already listed there, and some are deliberately not planned.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What question or task is hard today?
+      description: Describe the situation (the kind of video, what you asked the agent, what was missing).
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help?
+      description: The behavior you would like. If it changes the CLI output, sketch the new lines.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+  - type: checkboxes
+    id: local
+    attributes:
+      label: Local by design
+      options:
+        - label: The proposal keeps everything local by default (anything that uploads would be opt-in and clearly labeled).
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Contribution
+      options:
+        - label: I would like to work on this.
