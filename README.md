@@ -51,7 +51,7 @@ Tell your coding agent:
 
 The agent follows [`INSTALL.md`](INSTALL.md): it explains what video-watch does, checks `uv` and
 `ffmpeg`, runs `doctor` to look at your GPU, asks only the real choices (Whisper model, the optional
-sound map, CPU mode if there is no NVIDIA GPU, which agents to install into), states download sizes
+sound map, CPU mode if there is no NVIDIA GPU or Apple Silicon Mac, which agents to install into), states download sizes
 before downloading, and verifies the install with a short public test video.
 
 ### With the skills CLI
@@ -122,7 +122,10 @@ when it loads the skill.
   (`winget install Gyan.FFmpeg`, `brew install ffmpeg`, `sudo apt install ffmpeg`, ...). Transcripts
   of online videos work without them.
 - **Node.js or Deno** on `PATH` for YouTube: yt-dlp needs a JavaScript runtime there.
-- **An NVIDIA GPU is recommended.** Whisper runs on CUDA (`float16`, NVIDIA driver 525 or newer).
+- **An NVIDIA GPU or an Apple Silicon Mac is recommended.** Whisper runs on CUDA (`float16`, NVIDIA
+  driver 525 or newer), or on an Apple Silicon Mac's GPU through
+  [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (`device: auto` picks
+  it; `float16`, greedy decoding, the Whisper weights are downloaded in MLX format).
   Without a usable GPU, video-watch does not fall back to the CPU on its own, and not to YouTube's
   auto-captions either: `fetch` stops with exit 3, `ERROR: no usable CUDA GPU for Whisper (…)` and
   a `HINT:` explaining CPU mode, which you can choose explicitly (`setup --device cpu --model small`
@@ -145,6 +148,11 @@ recommendation: you can choose any model, and `doctor` and `setup` warn when mem
 | 8 GB cards and up (7800 MiB or more) | `large-v3` (default) | Best accuracy, especially outside English. 3.1 GB download. |
 | 4 to 8 GB (3900 MiB or more) | `large-v3-turbo` | A pruned large-v3: faster and smaller, somewhat weaker outside English. 1.6 GB. |
 | Under 4 GB, or CPU mode | `small` | Much faster on the CPU; noticeably less accurate. 0.5 GB. |
+
+On an Apple Silicon Mac the unified memory decides instead: 16 GB or more → `large-v3`, 8 GB or
+more → `large-v3-turbo`, otherwise `small`. Measured on an M5 Pro with 24 GB: `large-v3` transcribes
+at about 0.1 min per minute of audio (an hour of video in about 6 minutes), `large-v3-turbo` at 0.03
+and `small` at 0.026, roughly 2.5 to 4 times faster than the same model on the Mac's CPU.
 
 Valid models: `large-v3`, `large-v3-turbo`, `large-v2`, `medium`, `small`, `base`, `tiny`.
 
@@ -259,8 +267,8 @@ the file by hand. An invalid setting stops every command with an `ERROR:` and a 
 | Windows, NVIDIA GPU (CUDA) | Supported, full speed. Developed and measured on Windows 11 with an RTX 5060 Ti 16 GB. |
 | Linux, NVIDIA GPU (CUDA) | Supported. The CLI finds the CUDA libraries from its Python packages by itself. Verified on WSL (Arch Linux) with the `small` model; reports from native Linux welcome. |
 | Windows and Linux, CPU mode | Supported when chosen explicitly. Slow; use a small model. The sound map needs an NVIDIA GPU. |
-| macOS, CPU mode | Expected to work, but not tested yet: [reports welcome](https://github.com/AAyberkU/video-watch/issues/new?template=platform_support.yml). |
-| macOS GPU (Apple Silicon / Metal) | Not yet. [Help wanted](docs/help-wanted/macos-gpu.md). |
+| macOS, Apple Silicon (M1 and later), Apple GPU | Supported through mlx-whisper (`device: auto`). Measured on an Apple M5 Pro with 24 GB; see [`docs/DESIGN.md`](docs/DESIGN.md#apple-silicon-engine). Frames work as everywhere; the sound map needs an NVIDIA GPU. Reports from other chips welcome. |
+| macOS, CPU mode | Supported when chosen explicitly (every Mac, including Intel): about 4 min per hour of audio with `small` on an M5 Pro. |
 | AMD and Intel GPUs | Not yet. [Help wanted](docs/help-wanted/amd-intel-gpu.md). |
 
 | Agent | Status |
@@ -298,14 +306,15 @@ Short version, as of October 2026 (details and sources in
 - **Similar local pipelines** such as claude-video and claude-real-video combine yt-dlp, Whisper and
   ffmpeg frames too. They have larger communities and broader platform support today, including
   macOS, and some offer cloud engines or extra paid analysis.
-- **video-watch focuses on** local large-v3 transcription on NVIDIA GPUs, a strict subtitle policy
+- **video-watch focuses on** local large-v3 transcription on NVIDIA GPUs and Apple Silicon, a strict subtitle policy
   (never a translated track; the source is always stated), frames paired with what is said and
   heard, and a free, local, queryable sound map.
 
 ## Contributing
 
-Contributions are welcome, especially from macOS, AMD and Intel GPU owners: video-watch does not run
-at full speed on those machines yet, and you can change that. See
+Contributions are welcome, especially from AMD and Intel GPU owners (and anyone with an Intel Mac or
+an older Apple chip to report): video-watch does not run at full speed on AMD and Intel GPUs yet, and
+you can change that. See
 [`CONTRIBUTING.md`](CONTRIBUTING.md), the [roadmap](ROADMAP.md), the
 [help-wanted drafts](docs/help-wanted/) and the [design notes](docs/DESIGN.md).
 

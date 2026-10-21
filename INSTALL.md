@@ -126,11 +126,13 @@ It always exits 0 and prints `KEY: value` lines. What they mean:
 | --- | --- |
 | `OS:`, `PYTHON:`, `UV:` | System and tool versions (`UV: missing` when uv is not on `PATH`). |
 | `FFMPEG:`, `FFPROBE:` | Version or path; `missing` (step 2); or `blocked: <path> (<reason>)` when they are installed but this process may not run them (an agent sandbox, see [Codex on Windows](#codex-on-windows)). |
-| `GPU:`, `VRAM_TOTAL_MB:`, `VRAM_FREE_MB:` | The NVIDIA GPU with its driver (or `none`) and its memory. |
+| `GPU:`, `VRAM_TOTAL_MB:`, `VRAM_FREE_MB:` | The NVIDIA GPU with its driver, or the chip of an Apple Silicon Mac (then the memory is its unified memory), or `none`. |
 | `CUDA:` | `ok (…)`, or `unavailable: <reason>` (no NVIDIA GPU, a driver older than 525, or macOS). |
+| `METAL:` | `ok (…)` on an Apple Silicon Mac, where Whisper runs on the Apple GPU; `unavailable: <reason>` everywhere else. |
 | `DISK_FREE_GB:` | Free space on the drive of the model folder. |
 | `CONFIG:` | The settings file (`(not created yet)` on a new install). |
 | `DEVICE:`, `MODEL:`, `MODEL_DIR:`, `SOUNDS:`, `WORK_DIR:` | Current settings (defaults on a new install). |
+| `ENGINE:` | What `DEVICE:` means on this machine: faster-whisper on CUDA or on the CPU, or mlx-whisper on the Apple GPU. |
 | `MODEL_CACHED:`, `SOUND_MODEL_CACHED:` | Whether the models are already downloaded. |
 | `SOUND_HELPER_READY:` | Whether `setup --sounds on` has prepared the sound map's PyTorch environment. `no` until that setup ran once, also on machines that already have the sound model. |
 | `RECOMMEND_MODEL:`, `RECOMMEND_DEVICE:`, `RECOMMEND_SOUNDS:` | What the tool suggests for this machine; `RECOMMEND_SOUNDS:` gives its reason in brackets. |
@@ -150,7 +152,8 @@ Ask these together in one short message, each with your recommendation, so the u
 
 **(a) Speech model** (turns speech into text when a video has no subtitles).
 Recommend `RECOMMEND_MODEL:` (`large-v3` from about 8 GB of graphics memory, `large-v3-turbo` from
-about 4 GB, otherwise and in CPU mode `small`). The user may pick any of `large-v3`,
+about 4 GB, otherwise and in CPU mode `small`; on an Apple Silicon Mac from 16 GB and 8 GB of
+memory). The user may pick any of `large-v3`,
 `large-v3-turbo`, `large-v2`, `medium`, `small`, `base`, `tiny`. In plain words: bigger models are
 more accurate but need more graphics memory and download space; `large-v3` is the most accurate
 (about 3.1 GB download), `large-v3-turbo` is faster and lighter with a little less accuracy (about
@@ -167,7 +170,9 @@ adds about one minute per hour of video. You can switch it on or off later."
 Recommend **yes** when `RECOMMEND_SOUNDS:` says yes (an NVIDIA GPU with 6 GB or more); otherwise
 recommend no, and do not offer it at all when there is no NVIDIA GPU.
 
-**(c) CPU mode** (only when `CUDA:` is unavailable or `GPU:` is `none`, including every Mac).
+**(c) CPU mode** (only when `CUDA:` and `METAL:` are both unavailable, or `GPU:` is `none`; an Apple
+Silicon Mac with `METAL: ok` needs no CPU mode: its GPU runs Whisper with device `auto`, so skip
+this question there and say that the Mac's graphics chip is used).
 Explain: "Your computer has no usable NVIDIA graphics card, so speech recognition would run on the
 processor. That works but is much slower: with the `small` model roughly 5 minutes per hour of
 video on a typical desktop processor, longer on laptops; `large-v3-turbo` takes about 2.5 times
@@ -175,7 +180,8 @@ and `large-v3` about 5 times as long. Videos with subtitles are unaffected. Do y
 `small` model, unless the user would rather fix the GPU driver first. The sound map is not
 available without an NVIDIA GPU. On Windows and Linux the tool's packages still include about
 1.2 GB of NVIDIA libraries even in CPU mode (a known limitation); Macs do not download them.
-macOS CPU mode is expected to work but has not been tested yet; say so honestly.
+On an Intel Mac, CPU mode is the only choice; it is verified on Apple Silicon only, so say that
+honestly. An Apple Silicon Mac that chose CPU mode earlier can switch with `setup --device auto`.
 Never choose CPU mode without the user's yes; the tool never falls back to the CPU by itself.
 
 **(d) Which agents get the skill.**
@@ -283,8 +289,8 @@ per download, `DOWNLOAD_TOTAL_GB:`, any `WARN:` lines, `CONFIG: <path> (would wr
 
 | Download | Size |
 | --- | --- |
-| The tool's Python packages (once, into uv's cache) | about 1.4 GB on Windows, 1.5 GB on Linux (mostly NVIDIA CUDA libraries, also in CPU mode), 0.2 GB on macOS |
-| Whisper model | `large-v3` 3.1 GB, `large-v3-turbo` 1.6 GB, `large-v2` 3.1 GB, `medium` 1.5 GB, `small` 0.5 GB, `base` 0.15 GB, `tiny` 0.08 GB |
+| The tool's Python packages (once, into uv's cache) | about 1.4 GB on Windows, 1.5 GB on Linux (mostly NVIDIA CUDA libraries, also in CPU mode), 0.7 GB on Apple Silicon Macs (MLX), 0.2 GB on Intel Macs |
+| Whisper model (on an Apple Silicon Mac with device `auto`, the MLX version of the same size) | `large-v3` 3.1 GB, `large-v3-turbo` 1.6 GB, `large-v2` 3.1 GB, `medium` 1.5 GB, `small` 0.5 GB, `base` 0.15 GB, `tiny` 0.08 GB |
 | Sound map (only with `--sounds on`) | PyTorch environment about 3.0 GB plus the model about 2.3 GB |
 
 With `--sounds on`, the plan lists `DOWNLOAD: sound map environment (PyTorch with CUDA 12.8,

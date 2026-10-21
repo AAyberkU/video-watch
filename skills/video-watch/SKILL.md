@@ -2,7 +2,7 @@
 name: video-watch
 description: Use when the user shares a video link (YouTube, TikTok, Instagram, X/Twitter, Vimeo, Dailymotion, Twitch, Facebook, Reddit or any other site yt-dlp supports), a playlist or channel link, or a local video file path AND asks anything about the video - a summary, what is said or shown, what happens at a moment, music or other sounds, opinions, comparisons. Lets you "watch" it locally - a transcript from manual subtitles or local Whisper, an optional map of non-speech sounds, and timestamped still frames when the visuals matter; lists playlists before fetching videos. Nothing is uploaded. Do not use when a link or file is only being saved, shared or noted without a question about its content.
 license: MIT
-compatibility: Needs uv and ffmpeg. Whisper runs on an NVIDIA GPU (CUDA), or on the CPU only when the user chose CPU mode.
+compatibility: Needs uv and ffmpeg. Whisper runs on an NVIDIA GPU (CUDA) or an Apple Silicon Mac's GPU, or on the CPU only when the user chose CPU mode.
 ---
 
 # video-watch
@@ -78,6 +78,8 @@ for long videos. Each line is `[mm:ss] text`, or `[h:mm:ss] text` for videos of 
 - **`ESTIMATE:` on stderr** before a long Whisper run: relay its expected time to the user.
 - **`CACHED: yes`:** the transcript already exists from earlier; reuse it.
 - **`NOTE: transcribed on the CPU …`:** the user chose CPU mode; same model, only slower.
+- **`NOTE: transcribed on the Apple GPU …`:** an Apple Silicon Mac; same model on the Mac's GPU,
+  with greedy decoding instead of beam search (a few more small word errors are possible).
 - **`NOTE: VAD found little speech …; retried with VAD off`:** the tool already reran Whisper
   without VAD (music-heavy video); do not do it by hand. VAD-off transcripts can contain
   hallucinated filler such as "Subtitles by the Amara.org community"; treat such lines as noise.
@@ -220,7 +222,7 @@ list was truncated at `--limit`.
 | 1, `ERROR: ffmpeg …` | ffmpeg failed on this video | Rerun once, then report it. Do not upgrade yt-dlp. |
 | 1, `ERROR: another run is using this video` | A run for this video is still active | Wait for it to finish, then retry. |
 | 3, `ERROR: no usable CUDA GPU for Whisper (…)` | No usable NVIDIA GPU, driver or CUDA libraries. There is no fallback, not even auto-captions; the tool never switches to the CPU by itself | Explain the `HINT:`. Offer CPU mode only as the user's choice: `--device cpu --model small` for one run, or `setup --device cpu --model small` to keep it (slow). Suggest running `doctor`. |
-| 3, `ERROR: Whisper could not run on the GPU (…)` | The GPU is busy or out of memory (YouTube falls back to auto-captions instead; other sources stop) | Retry when the GPU is free (close games or other GPU apps), or offer a smaller model (`--model large-v3-turbo` or `small`). |
+| 3, `ERROR: Whisper could not run on the GPU (…)` | The GPU is busy or out of memory (YouTube falls back to auto-captions instead; other sources stop), or, on a Mac, the Apple GPU engine could not start (then also on YouTube, and the `HINT:` says so) | Retry when the GPU is free (close games or other GPU apps), or offer a smaller model (`--model large-v3-turbo` or `small`). If the Apple GPU engine could not start, rerun once, then follow the `HINT:` (CPU mode only as the user's choice). |
 | 3, `ERROR: sound map unavailable: …` (`sounds` only) | The sound map is not set up (also after an update, until `setup --sounds on --yes` runs once), there is no visible NVIDIA GPU, or the GPU is busy | Say so; answer from the transcript. Follow the `HINT:`: retry later for a busy GPU; offer `setup --sounds on` (ask first, state the printed size) when it is not set up. |
 | 1, `ERROR:` about the config, a setting or the work dir | An invalid config file, `VIDEO_WATCH_*` value or `work_dir` | Explain the `HINT:`; change settings only with the user's consent. |
 | 1, any other `ERROR:` whose `HINT:` names yt-dlp | Extraction failure: yt-dlp is outdated, the site changed, or the stream was refused | Retry once with `uv run --upgrade-package yt-dlp "<skill-dir>/scripts/video_watch.py" fetch "<url>"`. Upgrade only when the `HINT:` names yt-dlp. |

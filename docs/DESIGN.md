@@ -68,10 +68,10 @@ given there.
   its model card, so it is the recommendation for 4–8 GB GPUs rather than the default (an adaptive
   batch lets large-v3 itself run on 6 GB cards, more slowly). `large-v2`
   stays available for videos where v3 falls into repetition loops.
-- **Alternatives:** whisper.cpp (CUDA, Vulkan, Metal) and ffmpeg's `whisper` filter are candidate
-  second engines for platforms faster-whisper does not serve well (see the
-  [roadmap](../ROADMAP.md)). WhisperX and HF transformers were not chosen. Paid cloud APIs were
-  never the default.
+- **Alternatives:** the second engine for Apple Silicon is mlx-whisper (see
+  [Apple Silicon engine](#apple-silicon-engine)); whisper.cpp (Vulkan) and ffmpeg's `whisper` filter
+  are candidates for AMD and Intel GPUs (see the [roadmap](../ROADMAP.md)). WhisperX and HF
+  transformers were not chosen. Paid cloud APIs were never the default.
 
 ## Transcript source order
 
@@ -318,6 +318,9 @@ means. The sound map turns them into a timeline the agent reads as text. Researc
   explaining CPU mode. YouTube's auto-captions are not used in that case either: the machine cannot
   run Whisper at all, and the user should decide about CPU mode rather than silently get weaker
   captions every time.
+- **The same on Apple Silicon.** An Apple GPU engine that cannot start (mlx-whisper missing, no
+  Metal) is an error with a hint about CPU mode, never a CPU run, and never YouTube's auto-captions
+  either (they replace Whisper only for a GPU that is busy or full).
 - **A busy GPU is different.** When a GPU exists but is out of memory or busy (a game, another
   model), retrying later helps, so YouTube keeps its auto-captions fallback and other sources exit 3
   with a retry hint.
@@ -358,11 +361,76 @@ means. The sound map turns them into a timeline the agent reads as text. Researc
 - **Known limitation:** the CUDA wheels (about 1.2 GB) are part of the script's inline dependencies
   on Windows and Linux, so CPU-only machines download them too (macOS does not). Splitting them out
   is on the [roadmap](../ROADMAP.md).
-- **macOS:** no CUDA, so only CPU mode applies. It is expected to work (the CUDA wheels are skipped
-  there), but it has not been run on a Mac yet.
-- **Not yet supported:** macOS GPUs (Metal) and AMD/Intel GPUs. faster-whisper's CTranslate2 backend
-  runs on CUDA or the CPU, so these need a second engine (for example whisper.cpp or MLX); the sound
-  map's PyTorch path is CUDA-only in this release. See the [help-wanted drafts](help-wanted/).
+- **macOS:** no CUDA. On Apple Silicon `auto` runs Whisper on the Apple GPU (next section); CPU mode
+  (the CUDA wheels are skipped there) works on every Mac when chosen. Verified on an Apple M5 Pro
+  (24 GB, macOS 27): `small` int8 on the CPU transcribed the 18:40 English lecture in 71 s (RTF
+  0.063).
+- **Not yet supported:** AMD/Intel GPUs, which need another engine (for example whisper.cpp with
+  Vulkan), and the sound map on anything but an NVIDIA GPU (its PyTorch path is CUDA-only in this
+  release). See the [help-wanted drafts](help-wanted/).
+
+### Apple Silicon engine
+
+- **Choice:** mlx-whisper (Apple's MLX framework) on the Apple GPU, selected by `device: auto` on an
+  arm64 Mac (`metal` explicitly; `cpu` still means faster-whisper on the CPU). Its weights are
+  `mlx-community/whisper-*` conversions in float16, the same sizes as the CTranslate2 ones.
+- **Why not whisper.cpp with Metal** (pywhispercpp 1.5.1, also installable through the PEP 723
+  header, prebuilt Metal wheel, native Silero VAD, word timestamps): the speed is similar, but the
+  no-VAD pass, which is the music-video retry path, went wrong with `large-v3-turbo` and the
+  binding's default greedy settings (458 words for a 318-word song, word error 0.49 against 0.04
+  for mlx-whisper on the same song), and its language detection is a separate call. mlx-whisper
+  has the temperature fallback and compression-ratio check of OpenAI's reference decoder, word
+  timestamps from the cross-attention alignment, and its transcription path needs no binary. The
+  cost of mlx-whisper is a bigger environment (MLX, numba and SciPy: about 0.7 GB in uv's cache,
+  with its PyTorch dependency overridden away because only the conversion tool imports it) than
+  whisper.cpp's wheel, and it has no VAD and no beam search.
+- **VAD:** mlx-whisper has none, so faster-whisper's Silero VAD (already a dependency, the same
+  settings, `min_silence_duration_ms` 500) cuts the audio, the speech chunks are joined end to end
+  and decoded in one call, and every segment and word time is mapped back to the original timeline.
+  This was measured against passing the chunks as `clip_timestamps`, which decodes each chunk in
+  its own 30 s window and was 2.4 to 4.4 times slower with `small` (RTF 0.041 to 0.074 against
+  0.017 without VAD). An empty
+  VAD result returns no segments, so the automatic no-VAD retry behaves as on CUDA.
+- **Decoding differences:** greedy decoding with temperature fallback instead of beam search 5
+  (mlx-whisper has no beam search; the header says `beam 1`), no batching, and the
+  language probability comes from `detect_language` on the first 30 s of speech.
+- **Measured** on an Apple M5 Pro (15 cores, 24 GB, macOS 27) with three 3-minute public clips,
+  `fetch`'s Whisper settings (word timestamps on, no conditioning on the previous text, language
+  auto-detected): an English lecture with manual subtitles (3Blue1Brown, 0:30-3:30), a Turkish talk
+  with manual Turkish subtitles (TEDxIstanbul, 1:00-4:00) and a pop song (0:00-3:00, English
+  subtitles). RTF is transcription time over audio time (model already loaded, VAD included); WER is
+  the word error against the subtitle text (subtitles are not verbatim, so only the comparison
+  between engines is meaningful); the music clip is the no-VAD pass, because Silero VAD drops all of
+  a song with every engine; memory is the peak resident set size of the process.
+
+  | Engine and model | RTF en / tr / music | WER en / tr / music | Peak memory |
+  | --- | --- | --- | --- |
+  | faster-whisper CPU int8, beam 5, `large-v3-turbo` | 0.108 / 0.099 / 0.142 | 0.060 / 0.100 / 0.094 | 3.8 GB |
+  | **mlx-whisper Apple GPU, `large-v3-turbo`** | **0.026 / 0.025 / 0.032** | **0.043 / 0.034 / 0.044** | 2.1 GB |
+  | whisper.cpp Metal, `large-v3-turbo` | 0.031 / 0.031 / 0.040 | 0.043 / 0.047 / 0.487 | 2.0 GB |
+  | faster-whisper CPU int8, beam 5, `small` | 0.069 / 0.103 / 0.146 | 0.028 / 0.169 / 0.167 | 2.4 GB |
+  | **mlx-whisper Apple GPU, `small`** | **0.019 / 0.019 / 0.013** | **0.055 / 0.087 / 0.189** | 1.2 GB |
+  | whisper.cpp Metal, `small` | 0.017 / 0.017 / 0.012 | 0.052 / 0.116 / 0.063 | 0.9 GB |
+  | mlx-whisper Apple GPU, `large-v3` | 0.064 / 0.065 / not run | 0.050 / 0.025 / not run | 3.9 GB |
+
+  The CPU baseline's batched VAD run dropped words in the Turkish clip (301 of 320 with turbo; its
+  no-VAD run scores 0.034), which is why its VAD numbers are worse than the engines' without it. The
+  Apple GPU is about four times faster than this Mac's CPU with `large-v3-turbo` and three to five
+  times faster with `small` on these clips (2.4 times end to end on the full lecture, where audio
+  decoding and VAD weigh more), at similar accuracy on English and Turkish speech (`small` is worse
+  on the song: 0.19 against 0.17 for the CPU run and 0.06 for whisper.cpp). End to end on the 18:40 lecture
+  through `fetch` (audio decoding, VAD and transcription): `small` RTF 0.026 (CPU int8: 0.063),
+  `large-v3-turbo` 0.031 and `large-v3` 0.095 (model loading takes 1 to 2 s once cached; the first
+  load after installing took 11 to 17 s). These are the numbers behind the
+  `ESTIMATE:` of the Apple GPU engine. Every engine ran with the same decoding options except the
+  beam size, so the table is a comparison of engines on one Mac, not a benchmark of the models.
+- **Memory** is unified memory shared with the system, so `doctor` reads the Mac's total memory
+  (`sysctl hw.memsize`) in place of VRAM. The recommendation is `large-v3` from 16 GB,
+  `large-v3-turbo` from 8 GB and `small` below; a warning appears when a model's peak plus 3 GB
+  exceeds the memory.
+- **Not done here:** the sound map on the Apple GPU (separate item in the roadmap), and a batched
+  decoder (mlx-whisper decodes one 30 s window at a time and was already several times faster than
+  the CPU).
 - **No hard-coded machine paths:** models, caches, the work directory and the label font are
   discovered per OS or configured. A configured work directory must be new, empty or already
   carry the `.video-watch-work-root` marker, because the purge and `clean --all` delete inside it.

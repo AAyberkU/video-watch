@@ -38,7 +38,7 @@ A real `setup` (with downloads) needs the packages; started in the light form, i
 ## Commands
 
 ```text
-uv run video_watch.py fetch <url-id-or-path> [--whisper] [--lang CODE] [--no-vad] [--model NAME] [--device auto|cuda|cpu] [--sounds | --no-sounds] [--cookies-from-browser BROWSER]
+uv run video_watch.py fetch <url-id-or-path> [--whisper] [--lang CODE] [--no-vad] [--model NAME] [--device auto|cuda|metal|cpu] [--sounds | --no-sounds] [--cookies-from-browser BROWSER]
 uv run video_watch.py frames <url-id-or-path> --at 1:23,4:56[,...] [--max-frames 200] [--cookies-from-browser BROWSER]
 uv run video_watch.py frames <url-id-or-path> --overview [--interval SECONDS] [--scene-threshold 0.3] [--max-frames 200] [--cookies-from-browser BROWSER]
 uv run video_watch.py frames <url-id-or-path> --range 1:00-1:10 [--fps 2] [--max-frames 200] [--cookies-from-browser BROWSER]
@@ -47,7 +47,7 @@ uv run video_watch.py playlist <url> [--limit 200] [--cookies-from-browser BROWS
 uv run video_watch.py clean <video-id-url-path-or-work-key>
 uv run video_watch.py clean --all
 uv run video_watch.py doctor
-uv run video_watch.py setup [--device auto|cuda|cpu] [--model NAME] [--sounds on|off] [--model-dir PATH] [--yes] [--dry-run]
+uv run video_watch.py setup [--device auto|cuda|metal|cpu] [--model NAME] [--sounds on|off] [--model-dir PATH] [--yes] [--dry-run]
 uv run video_watch.py config show | path | get KEY | set KEY VALUE | unset KEY
 ```
 
@@ -59,7 +59,7 @@ uv run video_watch.py config show | path | get KEY | set KEY VALUE | unset KEY
 | `--lang CODE` | Override the video's spoken language (for example `en`, `de`, `tr`). On sites that do not state a language, it also lets a manual subtitle track in that language be used. |
 | `--no-vad` | Disable voice activity detection, for music-heavy videos where speech gets dropped. Uses the sequential decoder, about 1.6x slower. Rarely needed by hand: a VAD run that finds almost no speech is retried without VAD automatically (see [No-VAD auto-retry](#no-vad-auto-retry)). |
 | `--model NAME` | Whisper model for this run: `large-v3` (default), `large-v3-turbo`, `large-v2`, `medium`, `small`, `base`, `tiny`. `large-v2` helps on videos where v3 falls into repetition loops. |
-| `--device auto\|cuda\|cpu` | Device for this run. `auto` and `cuda` both mean the NVIDIA GPU: without usable CUDA, `fetch` stops with exit 3 (see [Devices](#devices-gpu-and-cpu)); it never switches to the CPU silently. `cpu` runs Whisper on the CPU (int8, slow). |
+| `--device auto\|cuda\|metal\|cpu` | Device for this run. `auto` means the GPU of the machine: the NVIDIA GPU, or the Apple GPU on an Apple Silicon Mac. `cuda` is the NVIDIA GPU and `metal` the Apple GPU. Without a usable GPU, `fetch` stops with exit 3 (see [Devices](#devices-gpu-and-cpu)); it never switches to the CPU silently. `cpu` runs Whisper on the CPU (int8, slow). |
 | `--sounds` | Build the [sound map](#sound-map) for this run even when it is disabled in the configuration. If it is not set up, the transcript is still printed with `NOTE: sound map skipped: the sound map is not set up yet …` and exit 0; nothing is downloaded. `--sounds` and `--no-sounds` together are a usage error. |
 | `--no-sounds` | Skip the sound map and its back-fill for an older cached transcript. A sound map already cached is still reported. |
 | `--cookies-from-browser firefox` | Use the browser's cookies for the site. Never on the first attempt: only after `NEEDS_COOKIES` (exit 2) and only with the user's consent. See [Cookies](#cookies). |
@@ -173,12 +173,17 @@ ESTIMATE: ~5.0 min for 1:03:30 of audio (whisper small, on the CPU, slow)
   at batch 1. `--no-vad` replaces it with 1.6 (the sequential decoder).
 - **CPU:** `0.2 + RTF × audio minutes`, with RTF 0.36 for `large-v3` and `large-v2`, 0.25 `medium`,
   0.19 `large-v3-turbo`, 0.075 `small`, 0.035 `base`, 0.02 `tiny`; times 1.2 with `--no-vad`.
+- **Apple GPU:** `0.2 + RTF × audio minutes`, with RTF 0.095 for `large-v3` and `large-v2`, 0.055
+  `medium`, 0.031 `large-v3-turbo`, 0.026 `small`, 0.02 `base`, 0.018 `tiny`; the same with
+  `--no-vad` (no batches).
 - The first use of a model adds up to 1.5 min for its download (`incl. first-time model download`).
-- Calibrated on an RTX 5060 Ti and a 12-thread desktop CPU (6 threads); `medium`, `base` and `tiny`
-  are estimates. Slower hardware takes proportionally longer.
+- Calibrated on an RTX 5060 Ti, a 12-thread desktop CPU (6 threads) and an Apple M5 Pro (24 GB);
+  `medium`, `base` and `tiny` are estimates. Slower hardware takes proportionally longer.
 
 When a Whisper run used the CPU, stdout has
-`NOTE: transcribed on the CPU (int8, device cpu): slower than a GPU, same model`.
+`NOTE: transcribed on the CPU (int8, device cpu): slower than a GPU, same model`. A run on the Apple
+GPU has `NOTE: transcribed on the Apple GPU (mlx-whisper, float16, greedy decoding instead of beam
+search)`, and its transcript header says `whisper (<model>, float16, metal, …, beam 1, sequential)`.
 
 ### No-VAD auto-retry
 
@@ -233,7 +238,7 @@ built (`ERROR: sound map unavailable: …`). For `fetch`, a sound map that canno
 | Exit-3 `ERROR:` | Cause | `HINT:` |
 | --- | --- | --- |
 | `no usable CUDA GPU for Whisper (<reason>)` | No NVIDIA GPU, driver or CUDA libraries (device `auto` or `cuda`). | `no usable NVIDIA GPU (CUDA) was found. CPU mode works everywhere but is slow: rerun with --device cpu --model small, or make it the default with: setup --device cpu --model small --yes (downloads the small model, about 0.5 GB)` |
-| `Whisper could not run on the GPU (<reason>)` | The GPU is busy or out of memory (not YouTube; YouTube uses its auto-captions). | Retry later (close games or other GPU apps) or choose a smaller model; the auto-captions fallback exists only for YouTube. |
+| `Whisper could not run on the GPU (<reason>)` | The GPU is busy or out of memory (not YouTube; YouTube uses its auto-captions), or the Apple GPU engine cannot start at all (`device` `metal` or `auto` on a Mac: mlx-whisper missing or no Metal; never the auto-captions, also on YouTube). | Retry later (close games or other GPU apps) or choose a smaller model; the auto-captions fallback exists only for YouTube. For an Apple GPU engine that cannot start: `the Apple GPU engine (mlx-whisper) could not start. Rerun the command (uv reinstalls the packages of video_watch.py), or use CPU mode: --device cpu --model small, or … setup --device cpu --model small --yes`. |
 | `Whisper could not run on the GPU (<reason>) and no original-language auto-captions exist` | YouTube, GPU busy, and no `-orig` track. | As above. |
 
 Exit-1 causes are told apart by their `ERROR:` prefix, so a yt-dlp upgrade is suggested only for
@@ -516,13 +521,15 @@ PYTHON: <version>
 UV: <version | path | missing>
 FFMPEG: <version | blocked: <path> (<reason>) | missing>
 FFPROBE: <path | blocked: <path> (<reason>) | missing>
-GPU: <name (driver X) | none>
-VRAM_TOTAL_MB: <MiB | unknown>
+GPU: <name (driver X) | name (Apple GPU, unified memory) | none>
+VRAM_TOTAL_MB: <MiB (unified memory on a Mac) | unknown>
 VRAM_FREE_MB: <MiB | unknown>
 CUDA: ok (<details>) | unavailable: <reason>
+METAL: ok (<details>) | unavailable: <reason>
 DISK_FREE_GB: <free GB on the model directory's drive | unknown>
 CONFIG: <path> [(not created yet)]
-DEVICE: auto | cuda | cpu
+DEVICE: auto | cuda | metal | cpu
+ENGINE: faster-whisper (CUDA, float16) | mlx-whisper (Apple GPU, float16) | faster-whisper (CPU, int8)
 MODEL: <name>
 MODEL_DIR: <path>
 MODEL_CACHED: yes | no
@@ -531,7 +538,7 @@ SOUND_MODEL_CACHED: yes | no
 SOUND_HELPER_READY: yes | no
 WORK_DIR: <path>
 RECOMMEND_MODEL: <name>
-RECOMMEND_DEVICE: cuda | cpu
+RECOMMEND_DEVICE: cuda | metal | cpu
 RECOMMEND_SOUNDS: yes | no (<reason>)
 WARN: … (optional, may repeat)
 READY: yes | no
@@ -540,7 +547,17 @@ READY: yes | no
 - **`CUDA:`** In the light form, CUDA is judged from `nvidia-smi` and the driver version (525 or
   newer for CUDA 12): `ok (driver X; CTranslate2 is checked on the first run)`. When the script's
   packages are installed, CTranslate2's own device check is added. macOS is always
-  `unavailable: macOS has no CUDA (CPU mode only; Metal is not supported yet)`.
+  `unavailable: macOS has no CUDA (Whisper runs on the Apple GPU instead)` on Apple Silicon and
+  `… (CPU mode only)` on an Intel Mac.
+- **`METAL:`** `ok (mlx-whisper is checked on the first run)` on an Apple Silicon Mac in the light
+  form; with the script's packages installed, MLX's own check is added (`ok (mlx-whisper 0.4.3,
+  Metal)` or `unavailable: MLX sees no Metal GPU`). Every other machine says
+  `unavailable: needs macOS on Apple Silicon (an arm64 Mac)`. On a Mac, `GPU:` names the chip and
+  `VRAM_TOTAL_MB:` is its unified memory (the GPU shares it with the system); `VRAM_FREE_MB:` is
+  `unknown`.
+- **`ENGINE:`** What `DEVICE` resolves to on this machine: `auto` is the Apple GPU (mlx-whisper) on
+  Apple Silicon and CUDA (faster-whisper) elsewhere. `MODEL_CACHED:` looks for the weights of that
+  engine: the MLX conversion for the Apple GPU, the CTranslate2 conversion for CUDA and CPU mode.
 - **`SOUND_HELPER_READY:`** `yes` when `setup --sounds on` has prepared the sound map's environment
   (PyTorch with CUDA 12.8, `transformers`) for the current `sound_events.py`. It is recorded in a
   marker file, `<user cache>/video-watch/sound-helper.json` (`%LOCALAPPDATA%\video-watch`,
@@ -548,18 +565,23 @@ READY: yes | no
   a fingerprint of the helper's dependency header and model; a changed header needs a new setup.
   Machines that set up the sound map before the marker existed show `no` until
   `setup --sounds on --yes` runs once.
-- **`READY: yes`** means transcription can run now: the device is usable (`cpu`, or CUDA ok), the
+- **`READY: yes`** means transcription can run now: the device is usable (`cpu`, CUDA ok or Metal ok), the
   configured model is downloaded, ffmpeg and ffprobe are found, the configured work directory would
   be accepted, and, when the sound map is on, the sound model is downloaded, `SOUND_HELPER_READY` is
   `yes` and an NVIDIA GPU is present.
 - **Recommendations** use the GPU's total VRAM (MiB as `nvidia-smi` reports it): 7800 or more →
   `large-v3`; 3900 or more → `large-v3-turbo`; below that, or without usable CUDA → `small` with
-  `RECOMMEND_DEVICE: cpu`. The sound map is recommended from 6000 MiB with an NVIDIA GPU. These are
-  recommendations only; any model can be chosen.
+  `RECOMMEND_DEVICE: cpu`. On an Apple Silicon Mac with a working Metal engine the unified memory
+  decides, with `RECOMMEND_DEVICE: metal`: 16 GB or more → `large-v3`, 8 GB or more →
+  `large-v3-turbo`, otherwise `small`. The sound map is recommended from 6000 MiB with an NVIDIA
+  GPU (never on a Mac yet). These are recommendations only; any model can be chosen.
 - **Fit warnings** (also printed by `setup`): when even batch 1 of the model plus a 400 MB margin
   exceeds the total VRAM, `WARN: <model> needs about X GB of VRAM even at batch 1; … it will likely
   run out of memory …`; when only batch 8 does not fit, `WARN: memory may be tight for <model> on X
-  GB of VRAM: it runs with a smaller batch (slower) and fails while other apps hold VRAM`. Other
+  GB of VRAM: it runs with a smaller batch (slower) and fails while other apps hold VRAM`. On a
+  Mac the warning is `WARN: <model> needs about X GB of memory on the Apple GPU; this Mac has Y GB
+  shared with the system, so it may run out of memory …` when the model's peak plus 3 GB exceeds
+  the unified memory. Other
   `WARN:` lines cover a missing uv or ffmpeg, a blocked ffmpeg or ffprobe (`WARN: ffmpeg was found
   but cannot be run by this process; <sandbox hint>`), a device that cannot work, a model not
   downloaded yet,
@@ -583,7 +605,7 @@ uv run video_watch.py setup --device cuda --model large-v3-turbo --sounds on --m
 stdout:
 
 ```text
-DEVICE: auto | cuda | cpu
+DEVICE: auto | cuda | metal | cpu
 MODEL: <name>
 SOUNDS: on | off
 MODEL_DIR: <path>
@@ -601,8 +623,8 @@ SETUP: done                                 (exit 0)
 
 | Download | Size |
 | --- | --- |
-| The script's Python packages, once, into uv's cache (yt-dlp, faster-whisper and, except on macOS, the CUDA libraries) | about 1.4 GB on Windows, 1.5 GB on Linux, 0.2 GB on macOS |
-| Whisper model into `model_dir` | `large-v3` 3.1 GB, `large-v3-turbo` 1.6 GB, `large-v2` 3.1 GB, `medium` 1.5 GB, `small` 0.5 GB, `base` 0.15 GB, `tiny` 0.08 GB |
+| The script's Python packages, once, into uv's cache (yt-dlp, faster-whisper and, except on macOS, the CUDA libraries; on Apple Silicon also MLX and mlx-whisper) | about 1.4 GB on Windows, 1.5 GB on Linux, 0.7 GB on Apple Silicon, 0.2 GB on an Intel Mac |
+| Whisper model into `model_dir` (the CTranslate2 conversion for CUDA and CPU mode, the MLX conversion for the Apple GPU: the same sizes) | `large-v3` 3.1 GB, `large-v3-turbo` 1.6 GB, `large-v2` 3.1 GB, `medium` 1.5 GB, `small` 0.5 GB, `base` 0.15 GB, `tiny` 0.08 GB |
 | Sound map environment (PyTorch for CUDA 12.8, `transformers`) into uv's cache, with `--sounds on` while `SOUND_HELPER_READY` is `no` (listed as `… into the uv cache (less if uv already has it)`) | about 3.0 GB |
 | Sound model `facebook/pe-a-frame-base` into the sound cache, with `--sounds on` | about 2.3 GB |
 
@@ -614,8 +636,10 @@ SETUP: done                                 (exit 0)
   `model_dir` when given). A successful sound-map preparation also writes the
   `sound-helper.json` marker (see [`doctor`](#doctor)).
 - Exit 1 with `ERROR:` for: an invalid choice or config file; `--device auto` or `cuda` without
-  usable CUDA (`CUDA is unavailable for device auto: <reason>`, with a `HINT:` to use
-  `--device cpu --model small --sounds off`); `--sounds on` without an NVIDIA GPU (`the sound map
+  usable CUDA on a machine that is not Apple Silicon (`CUDA is unavailable for device auto:
+  <reason>`, with a `HINT:` to use `--device cpu --model small --sounds off`, on an Apple Silicon
+  Mac also `--device metal`); `--device metal` where the Apple GPU engine cannot run (`the Apple GPU
+  engine is unavailable for device metal: <reason>`); `--sounds on` without an NVIDIA GPU (`the sound map
   needs an NVIDIA GPU, and none was found`) or with an NVIDIA driver older than 525 (`the sound map
   needs an NVIDIA GPU with CUDA 12: …`, HINT: update the driver or rerun with `--sounds off`); a
   failed download.
@@ -661,9 +685,25 @@ change setup:
 
 ## Devices: GPU and CPU
 
-- **`auto` and `cuda`** both mean Whisper on the NVIDIA GPU with `float16`. On Linux the CLI
+- **`auto`** means the GPU of the machine: the Apple GPU on an Apple Silicon Mac (below), the
+  NVIDIA GPU everywhere else. **`cuda`** is always the NVIDIA GPU (`float16`). On Linux the CLI
   re-executes itself once with the CUDA wheels' library folders on `LD_LIBRARY_PATH` (the loader
   reads it only at start); on Windows it adds their DLL folders.
+- **`metal`** (also what `auto` means on Apple Silicon): Whisper on the Apple GPU through
+  mlx-whisper with `float16`. The same fetch contract as on CUDA (`SOURCE: whisper`, `SPEECH:`,
+  word timestamps in `segments.json`, VAD with the automatic no-VAD retry, the language from the
+  metadata, `--lang` or auto-detection with its probability in a `NOTE:`). Differences: greedy
+  decoding with temperature fallback instead of beam search (mlx-whisper has none, header `beam 1`),
+  no batching, and VAD is Silero (faster-whisper's own) cutting the silence out before the Apple
+  GPU decodes the speech chunks joined end to end (times are mapped back). The model weights are
+  MLX conversions (`mlx-community/whisper-*`) stored under `model_dir` next to the CTranslate2 ones,
+  so switching between `metal` and `cpu` downloads each once. Memory is the Mac's unified memory
+  (peak resident memory 1.2 GB for `small`, 2.1 GB for `large-v3-turbo`, 3.9 GB for `large-v3`).
+  Failures raise the same `GpuUnavailable` handling as CUDA: an out-of-memory or busy GPU falls
+  back on YouTube to its auto-captions or exits 3 (`ERROR: Whisper could not run on the GPU
+  (<reason>)`); an engine that cannot start at all (mlx-whisper missing, no Metal, `device: metal`
+  on a machine that is not Apple Silicon) exits 3 with that error and the Apple GPU `HINT:`, also
+  on YouTube, and never switches to the CPU. The sound map still needs an NVIDIA GPU.
 - **No usable CUDA:** `fetch` exits 3 with
   `ERROR: no usable CUDA GPU for Whisper (<reason>)` and the CPU-mode `HINT:` shown under
   [Exit codes and errors](#exit-codes-and-errors). There is no fallback, also not to YouTube's
@@ -698,14 +738,14 @@ change setup:
 
 | Setting | Value |
 | --- | --- |
-| Runtime | faster-whisper (CTranslate2), `BatchedInferencePipeline` |
+| Runtime | faster-whisper (CTranslate2), `BatchedInferencePipeline`; on the Apple GPU mlx-whisper (see [Devices](#devices-gpu-and-cpu)) |
 | Model | `large-v3` by default; configurable |
-| Device and precision | CUDA with `float16`; CPU (`int8`) only when chosen explicitly |
+| Device and precision | CUDA with `float16`; the Apple GPU with `float16`; CPU (`int8`) only when chosen explicitly |
 | Batch size | 8, 4, 2 or 1 by free VRAM on the GPU (see [Devices](#devices-gpu-and-cpu)); 4 on the CPU |
 | Language | From the video's metadata or `--lang`, otherwise auto-detect |
 | VAD | On, `min_silence_duration_ms=500`; auto-retry without VAD under 5 words per minute |
 | `condition_on_previous_text` | Off |
-| Beam size | 5 |
+| Beam size | 5 (1, greedy, on the Apple GPU) |
 | Word timestamps | On (stored in `segments.json`) |
 
 The model loads before the audio download, so GPU problems surface early.
@@ -717,8 +757,12 @@ environments. Notable pins:
 
 - `video_watch.py`: `yt-dlp[default,curl-cffi]` (browser impersonation, which Vimeo requires),
   `faster-whisper>=1.2.1,<2`, `ctranslate2>=4.5,<5`, `nvidia-cublas-cu12` and
-  `nvidia-cudnn-cu12>=9,<10` (except on macOS), and `av<16` (PyAV 16+ breaks faster-whisper 1.2.1
-  with a `metadata_errors` error). yt-dlp's JavaScript runtimes are set to deno and node.
+  `nvidia-cudnn-cu12>=9,<10` (except on macOS), `mlx-whisper>=0.4.3,<0.5` (only on Apple Silicon:
+  `sys_platform == 'darwin' and platform_machine == 'arm64'`), and `av<16` (PyAV 16+ breaks
+  faster-whisper 1.2.1 with a `metadata_errors` error). mlx-whisper declares PyTorch as a
+  dependency, but only its model-conversion tool imports it, so the header overrides it away
+  (`[tool.uv] override-dependencies`, about 0.5 GB saved). yt-dlp's JavaScript runtimes are set to
+  deno and node.
 - Known limitation: the CUDA wheels (about 1.2 GB) are installed on Windows and Linux even for CPU
   mode, because the inline dependencies cannot depend on the chosen device; splitting them out is
   on the [roadmap](../ROADMAP.md).
@@ -731,7 +775,11 @@ environments. Notable pins:
   environment with `uv run --upgrade-package yt-dlp video_watch.py fetch <url>`.
 - **`CUDA: unavailable` in `doctor`, or `ERROR: no usable CUDA GPU for Whisper`:** check the
   NVIDIA driver (`nvidia-smi`; version 525 or newer). Without a usable NVIDIA GPU, choose CPU mode
-  explicitly with a small model (`setup --device cpu --model small`).
+  explicitly with a small model (`setup --device cpu --model small`). On an Apple Silicon Mac,
+  `METAL:` in `doctor` should say `ok`; `device: auto` then runs Whisper on the Apple GPU.
+- **A Mac stays on the CPU or says `no usable CUDA`:** `device` may still be `cpu` from an earlier
+  setup (`setup --device auto --yes` switches to the Apple GPU and downloads the MLX weights), and
+  an Intel Mac, or Python running under Rosetta, has no Apple GPU engine.
 - **`CUBLAS_STATUS_NOT_SUPPORTED` on RTX 50-series:** the compute type must be `float16`, which the
   script uses on CUDA.
 - **`NEEDS_COOKIES` (exit 2):** the site wants a login. Ask the user before rerunning with
