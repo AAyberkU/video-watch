@@ -2,10 +2,11 @@
 
 Thank you for helping. Bug reports, platform reports, docs fixes and code are all welcome.
 
-**Own a Mac, an AMD GPU or an Intel GPU?** You are exactly who this project needs. video-watch only
-runs at full speed on NVIDIA GPUs today, and the maintainer cannot test other hardware. Even a
-`doctor` report and a timing from your machine helps; a second Whisper engine would be a big
-contribution. See the [help-wanted drafts](docs/help-wanted/) and the [roadmap](ROADMAP.md).
+**Own an AMD GPU, an Intel GPU or an Intel Mac?** You are exactly who this project needs.
+video-watch runs at full speed on NVIDIA GPUs and on Apple Silicon (through mlx-whisper), and the
+maintainer cannot test other hardware. Even a `doctor` report and a timing from your machine helps;
+another Whisper engine would be a big contribution. See the [help-wanted drafts](docs/help-wanted/)
+and the [roadmap](ROADMAP.md).
 
 ## Before you start
 
@@ -91,8 +92,9 @@ when the visuals matter, local files only read, and labels as acoustic cues rath
 
 ## Adding a Whisper engine or backend
 
-faster-whisper (CTranslate2) runs on CUDA and the CPU only. Supporting Apple Silicon, AMD or Intel
-GPUs means adding a second engine, for example MLX Whisper or whisper.cpp (Metal, Vulkan).
+faster-whisper (CTranslate2) runs on CUDA and the CPU only. Apple Silicon is served by a second
+engine, mlx-whisper (see `transcribe_metal()` and `load_metal()` in `video_watch.py` for a worked
+example); AMD and Intel GPUs need another one, for example whisper.cpp with Vulkan.
 
 **Where the Whisper code lives:** in `video_watch.py`, around `load_whisper()` (loads a model for a
 device), `transcribe()` (one transcription pass, with or without VAD), `run_whisper()` (the flow:

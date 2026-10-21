@@ -5,12 +5,18 @@
 #     "yt-dlp[default,curl-cffi]",
 #     "faster-whisper>=1.2.1,<2",
 #     "ctranslate2>=4.5,<5",
+#     # Apple GPU engine (Apple Silicon Macs only; Windows and Linux installs do not change).
+#     "mlx-whisper>=0.4.3,<0.5; sys_platform == 'darwin' and platform_machine == 'arm64'",
 #     # CUDA libraries for CTranslate2 (Windows and Linux; macOS has no CUDA and runs on the CPU).
 #     "nvidia-cublas-cu12; sys_platform != 'darwin'",
 #     "nvidia-cudnn-cu12>=9,<10; sys_platform != 'darwin'",
 #     # faster-whisper 1.2.1 passes `metadata_errors` to av.open(), which PyAV 16+ removed.
 #     "av>=11,<16",
 # ]
+# # mlx-whisper lists PyTorch as a dependency, but only its model-conversion tool imports it; the
+# # transcription path does not, so it is not installed (saves about 0.5 GB on Apple Silicon).
+# [tool.uv]
+# override-dependencies = ["torch; sys_platform == 'never'"]
 # ///
 """video-watch: transcripts (subtitles or local Whisper), a sound map and frames of any video.
 
@@ -20,7 +26,7 @@ separate uv script with its own PyTorch environment.
 
 Usage:
     uv run video_watch.py fetch <url-or-path> [--whisper] [--lang CODE] [--no-vad]
-                                              [--model NAME] [--device auto|cuda|cpu]
+                                              [--model NAME] [--device auto|cuda|metal|cpu]
                                               [--sounds | --no-sounds]
                                               [--cookies-from-browser BROWSER]
     uv run video_watch.py frames <url-or-path> --at 1:23,4:56 | --overview [--interval S]
@@ -33,7 +39,7 @@ Usage:
     uv run video_watch.py clean <video_id-url-path-or-key>
     uv run video_watch.py clean --all
     uv run video_watch.py doctor
-    uv run video_watch.py setup [--device auto|cuda|cpu] [--model NAME] [--sounds on|off]
+    uv run video_watch.py setup [--device auto|cuda|metal|cpu] [--model NAME] [--sounds on|off]
                                 [--model-dir PATH] [--yes] [--dry-run]
     uv run video_watch.py config show | path | get KEY | set KEY VALUE | unset KEY
 
@@ -46,6 +52,7 @@ from __future__ import annotations
 import argparse
 import base64
 import bisect
+import contextlib
 import ctypes
 import gc
 import glob
@@ -94,28 +101,37 @@ DOWNLOAD_PATTERNS = (
 CONFIG_ENV = "VIDEO_WATCH_CONFIG"
 CONFIG_KEYS = ("device", "model", "model_dir", "sounds", "sound_cache", "work_dir")
 CONFIG_ENV_VARS = {key: f"VIDEO_WATCH_{key.upper()}" for key in CONFIG_KEYS}
-DEVICES = ("auto", "cuda", "cpu")
+DEVICES = ("auto", "cuda", "metal", "cpu")
 DEFAULT_DEVICE = "auto"
 DEFAULT_MODEL = "large-v3"
 
-# Whisper models: faster-whisper (CTranslate2) conversions on the Hugging Face Hub, their download
-# size in MB, and the VRAM in MB a batched GPU run needs at batch 8 (for warnings and the batch
-# size). Sizes are the model.bin files plus tokenizer and config.
+# Whisper models: faster-whisper (CTranslate2) conversions on the Hugging Face Hub (CUDA and CPU
+# mode) and the mlx-whisper conversions (Apple GPU, float16), each with its download size in MB
+# (the weight files plus tokenizer and config).
 WHISPER_MODELS: dict[str, dict[str, Any]] = {
-    "large-v3": {"repo": "Systran/faster-whisper-large-v3", "size_mb": 3090},
-    "large-v3-turbo": {"repo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo", "size_mb": 1620},
-    "large-v2": {"repo": "Systran/faster-whisper-large-v2", "size_mb": 3090},
-    "medium": {"repo": "Systran/faster-whisper-medium", "size_mb": 1530},
-    "small": {"repo": "Systran/faster-whisper-small", "size_mb": 485},
-    "base": {"repo": "Systran/faster-whisper-base", "size_mb": 145},
-    "tiny": {"repo": "Systran/faster-whisper-tiny", "size_mb": 76},
+    "large-v3": {"repo": "Systran/faster-whisper-large-v3", "size_mb": 3090,
+                 "mlx_repo": "mlx-community/whisper-large-v3-mlx", "mlx_size_mb": 3084},
+    "large-v3-turbo": {"repo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo", "size_mb": 1620,
+                       "mlx_repo": "mlx-community/whisper-large-v3-turbo", "mlx_size_mb": 1614},
+    "large-v2": {"repo": "Systran/faster-whisper-large-v2", "size_mb": 3090,
+                 "mlx_repo": "mlx-community/whisper-large-v2-mlx", "mlx_size_mb": 3083},
+    "medium": {"repo": "Systran/faster-whisper-medium", "size_mb": 1530,
+               "mlx_repo": "mlx-community/whisper-medium-mlx", "mlx_size_mb": 1525},
+    "small": {"repo": "Systran/faster-whisper-small", "size_mb": 485,
+              "mlx_repo": "mlx-community/whisper-small-mlx", "mlx_size_mb": 481},
+    "base": {"repo": "Systran/faster-whisper-base", "size_mb": 145,
+             "mlx_repo": "mlx-community/whisper-base-mlx", "mlx_size_mb": 144},
+    "tiny": {"repo": "Systran/faster-whisper-tiny", "size_mb": 76,
+             "mlx_repo": "mlx-community/whisper-tiny-mlx", "mlx_size_mb": 74},
 }
 MODEL_NAMES = tuple(WHISPER_MODELS)
+MLX_WEIGHT_FILES = ("weights.safetensors", "weights.npz")
 
 # Whisper settings (fixed by design; see docs/DESIGN.md).
 COMPUTE_TYPE = "float16"  # int8/auto fail with CUBLAS_STATUS_NOT_SUPPORTED on RTX 50-series.
 CPU_COMPUTE_TYPE = "int8"  # the fast CPU type (no cuBLAS involved)
 BEAM_SIZE = 5
+WHISPER_SAMPLE_RATE = 16000
 BATCH_SIZE = 8
 VAD_MIN_SILENCE_MS = 500
 # Batched GPU runs pick the largest batch whose peak VRAM (below, plus a margin) fits the free VRAM.
@@ -147,6 +163,18 @@ BATCH_SENSITIVE_MODELS = ("large-v3", "large-v2", "medium")
 CPU_BATCH_SIZE = 4
 CPU_RTF = {"large-v3": 0.36, "large-v2": 0.36, "large-v3-turbo": 0.19, "medium": 0.25, "small": 0.075, "base": 0.035, "tiny": 0.02}
 CPU_SEQUENTIAL_SLOWDOWN = 1.2
+# Apple GPU engine (mlx-whisper, float16, greedy decoding): minutes per minute of audio, end to end
+# (audio decoding, VAD, transcription) on an Apple M5 Pro with 24 GB (measured by the contributor of
+# the engine, not by the maintainer), for the 18:40 English lecture
+# (small 0.026, turbo 0.031, large-v3 0.095; 3-minute clips run at 0.019, 0.026 and 0.065, and the
+# no-VAD pass is as fast). large-v2 has large-v3's architecture; medium, base and tiny are estimates.
+# Peak resident memory in MB of the 3-minute runs (unified memory, shared with the system);
+# medium, base and tiny are estimates.
+METAL_RTF = {"large-v3": 0.095, "large-v2": 0.095, "large-v3-turbo": 0.031, "medium": 0.055, "small": 0.026, "base": 0.02, "tiny": 0.018}
+METAL_PEAK_MB = {"large-v3": 3900, "large-v2": 3900, "large-v3-turbo": 2150, "medium": 2600, "small": 1200, "base": 600, "tiny": 450}
+METAL_MARGIN_MB = 3000  # what macOS and other apps keep, on top of the model, before a warning
+METAL_RECOMMEND_LARGE_MB = 16 * 1024  # unified memory for the large-v3 recommendation
+METAL_RECOMMEND_TURBO_MB = 8 * 1024
 # Expected wall-clock minutes per minute of audio for batched large-v3 on the RTX 5060 Ti,
 # plus a fixed overhead for model load and audio download. Calibrated from live runs
 # (3.6-63 min videos: transcription RTF 0.031-0.037, end-to-end 0.61 min for 12.6 min of
@@ -419,6 +447,15 @@ GPU_RETRY_HINT = (
     "apps) or choose a smaller model (--model large-v3-turbo or small). "
     "The auto-captions fallback exists only for YouTube"
 )
+METAL_HINT = (
+    "the Apple GPU engine (mlx-whisper) could not start. Rerun the command (uv reinstalls the packages of "
+    f"video_watch.py), or use CPU mode: --device cpu --model small, or {RUN_CMD} setup --device cpu --model small --yes"
+)
+METAL_NOT_MAC_HINT = (
+    "device metal (the Apple GPU engine, mlx-whisper) needs an Apple Silicon Mac. Rerun with --device auto "
+    f"(the NVIDIA GPU here) or --device cpu --model small, or change the default with: {RUN_CMD} setup --device auto"
+)
+MODEL_DOWNLOAD_HINT = "check the network and disk space, then rerun the command (or download the model first with setup)"
 NO_CUDA_HINT = (
     "no usable NVIDIA GPU (CUDA) was found. CPU mode works everywhere but is slow: rerun with "
     f"--device cpu --model small, or make it the default with: {RUN_CMD} setup --device cpu --model small --yes "
@@ -487,15 +524,23 @@ class FfmpegError(FetchError):
 
 
 class GpuUnavailable(Exception):
-    """Whisper could not run on the GPU (CUDA init, out of memory, missing CUDA libraries).
-    `no_cuda` marks a machine without a usable CUDA device, where retrying later cannot help."""
+    """Whisper could not run on the GPU (CUDA init, out of memory, missing CUDA libraries, the Apple
+    GPU engine). `no_cuda` marks a machine without a usable CUDA device, where retrying later cannot
+    help; `permanent` marks the same for the Apple GPU engine (never the YouTube auto-captions
+    fallback, which is for a busy or full GPU)."""
 
-    def __init__(self, message: str, no_cuda: bool = False):
+    def __init__(self, message: str, no_cuda: bool = False, permanent: bool = False, hint: str | None = None):
         super().__init__(message)
         self.no_cuda = no_cuda
+        self.permanent = permanent
+        self._hint = hint
 
     @property
     def hint(self) -> str:
+        if self._hint:
+            return self._hint
+        if self.permanent:
+            return METAL_HINT
         return NO_CUDA_HINT if self.no_cuda else GPU_RETRY_HINT
 
 
@@ -1404,7 +1449,7 @@ def header_lines(meta: dict[str, Any], long_form: bool = False, description: boo
         else:
             vad = "VAD off (auto-retry)" if s.get("vad_auto_retry") else "VAD off"
         mode = f"batched x{s.get('batch_size')}" if s.get("batched") else "sequential"
-        cpu = ", cpu" if s.get("device") == "cpu" else ""
+        cpu = f", {s['device']}" if s.get("device") in ("cpu", "metal") else ""
         source_desc = (
             f"whisper ({s.get('model')}, {s.get('compute_type')}{cpu}, {vad}, beam {s.get('beam_size')}, {mode})"
         )
@@ -1752,6 +1797,15 @@ def is_gpu_error(exc: BaseException) -> bool:
     return any(p in low for p in _GPU_ERROR_PATTERNS)
 
 
+_METAL_ERROR_PATTERNS = ("metal", "memory", "mlx", "gpu", "command buffer")
+
+
+def is_metal_error(exc: BaseException) -> bool:
+    """A failure of the Apple GPU engine (Metal errors, running out of unified memory)."""
+    low = str(exc).lower()
+    return isinstance(exc, MemoryError) or any(p in low for p in _METAL_ERROR_PATTERNS)
+
+
 def gpu_unavailable(exc: BaseException) -> GpuUnavailable:
     message = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
     low = message.lower()
@@ -1759,18 +1813,40 @@ def gpu_unavailable(exc: BaseException) -> GpuUnavailable:
     return GpuUnavailable(message, no_cuda=no_cuda)
 
 
-def model_cache_path(name: str, root: Path) -> Path:
-    """The Hugging Face cache folder of a Whisper model under the model dir."""
-    return root / ("models--" + WHISPER_MODELS[name]["repo"].replace("/", "--"))
+def model_cache_path(name: str, root: Path, device: str = "cuda") -> Path:
+    """The Hugging Face cache folder of a Whisper model under the model dir: the CTranslate2
+    conversion (CUDA and CPU mode) or, for the Apple GPU (`metal`), the mlx-whisper conversion."""
+    key = "mlx_repo" if device == "metal" else "repo"
+    return root / ("models--" + WHISPER_MODELS[name][key].replace("/", "--"))
 
 
-def model_cached(name: str, root: Path) -> bool:
-    """True when a complete snapshot (with model.bin) of the model is in the model dir."""
+def mlx_snapshot(name: str, root: Path) -> Path | None:
+    """The complete mlx-whisper snapshot (config and weights) of a model in the model dir."""
+    snapshots = model_cache_path(name, root, "metal") / "snapshots"
+    try:
+        for d in sorted(snapshots.iterdir()):
+            if (d / "config.json").is_file() and any((d / w).is_file() for w in MLX_WEIGHT_FILES):
+                return d
+    except OSError:
+        pass
+    return None
+
+
+def model_cached(name: str, root: Path, device: str = "cuda") -> bool:
+    """True when a complete snapshot of the model for this device is in the model dir (model.bin of
+    the CTranslate2 conversion, or config and weights of the mlx-whisper one for `metal`)."""
+    if device == "metal":
+        return mlx_snapshot(name, root) is not None
     snapshots = model_cache_path(name, root) / "snapshots"
     try:
         return any((d / "model.bin").is_file() for d in snapshots.iterdir())
     except OSError:
         return False
+
+
+def model_size_mb(name: str, device: str = "cuda") -> int:
+    """Download size in MB of the model's weights for this device."""
+    return WHISPER_MODELS[name]["mlx_size_mb" if device == "metal" else "size_mb"]
 
 
 def cpu_threads(platform: str | None = None, machine: str | None = None, logical: int | None = None) -> int:
@@ -1786,17 +1862,34 @@ def cpu_threads(platform: str | None = None, machine: str | None = None, logical
     return max(1, min(16, logical // 2))
 
 
+def apple_silicon(platform: str | None = None, machine: str | None = None) -> bool:
+    """True on a Mac with an Apple Silicon chip (the Apple GPU engine runs only there)."""
+    import platform as platform_mod
+
+    return platform_key(platform) == "darwin" and (machine or platform_mod.machine()).lower() in ("arm64", "aarch64")
+
+
+def effective_device(device: str) -> str:
+    """`cuda`, `metal` or `cpu` for a `device` setting: `auto` means the GPU of the machine, the
+    Apple GPU on Apple Silicon and CUDA elsewhere."""
+    if device == "auto":
+        return "metal" if apple_silicon() else "cuda"
+    return device
+
+
 def resolve_device(args: argparse.Namespace | None = None) -> str:
-    """`cpu` only when the user chose it; `auto` and `cuda` both mean the GPU (never a silent CPU run)."""
-    return "cpu" if setting("device", args) == "cpu" else "cuda"
+    """`cpu` only when the user chose it; `auto`, `cuda` and `metal` all mean a GPU (never a silent CPU run)."""
+    return effective_device(setting("device", args))
 
 
 def load_whisper(model_name: str, device: str = "cuda", root: Path | None = None) -> Any:
-    """The Whisper model on the GPU (float16) or, only when the user chose it, the CPU (int8).
-    A GPU problem raises GpuUnavailable; there is no CPU fallback. Cached models load without a
-    network round trip."""
+    """The Whisper model on the GPU (float16: CUDA, or the Apple GPU through mlx-whisper) or, only
+    when the user chose it, the CPU (int8). A GPU problem raises GpuUnavailable; there is no CPU
+    fallback. Cached models load without a network round trip."""
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
     root = root or model_dir()
+    if device == "metal":
+        return load_metal(model_name, root)
     local = model_cached(model_name, root)
     if device == "cpu":
         from faster_whisper import WhisperModel
@@ -1832,9 +1925,269 @@ def whisper_language(code: str | None) -> str | None:
     return base if base in _LANGUAGE_CODES else None
 
 
+@dataclass
+class MetalModel:
+    """A Whisper model loaded for the Apple GPU (mlx-whisper): its local snapshot folder."""
+
+    name: str
+    path: str
+
+
+@dataclass
+class TranscribeInfo:
+    """What the Apple GPU engine reports about a run, like faster-whisper's TranscriptionInfo."""
+
+    language: str | None
+    language_probability: float | None
+    duration: float
+
+
+def metal_status(machine: str | None = None, platform: str | None = None, deep: bool | None = None) -> tuple[bool, str]:
+    """Whether the Apple GPU engine can run here and why not. Read-only and without downloads: the
+    platform, plus MLX's own Metal check when its package is installed."""
+    if not apple_silicon(platform, machine):
+        return False, "needs macOS on Apple Silicon (an arm64 Mac)"
+    deep = importlib.util.find_spec("mlx_whisper") is not None if deep is None else deep
+    if not deep:
+        return True, "ok (mlx-whisper is checked on the first run)"
+    try:
+        import mlx.core as mx
+
+        available = mx.metal.is_available()
+        version = importlib.metadata.version("mlx-whisper")
+    except Exception as exc:  # noqa: BLE001 - any failure here means no usable Metal
+        return False, f"MLX could not start ({type(exc).__name__}: {exc})"
+    if not available:
+        return False, "MLX sees no Metal GPU"
+    return True, f"ok (mlx-whisper {version}, Metal)"
+
+
+def apple_gpu_info() -> GpuInfo:
+    """The chip name and the unified memory (MB; the GPU shares it with the system) of an Apple
+    Silicon Mac, read with sysctl; empty elsewhere or when sysctl fails."""
+    if not apple_silicon():
+        return GpuInfo()
+
+    def sysctl(key: str) -> str | None:
+        return tool_version(["sysctl", "-n", key])
+
+    name = sysctl("machdep.cpu.brand_string")
+    try:
+        total = int(int(sysctl("hw.memsize") or 0) / 1048576) or None
+    except ValueError:
+        total = None
+    return GpuInfo(name, total, None, None)
+
+
+def download_mlx_model(name: str, root: Path) -> Path:
+    """Download the mlx-whisper weights of a model into the model dir (progress on stderr) and
+    return the snapshot folder."""
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    from huggingface_hub import snapshot_download
+
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(snapshot_download(
+        WHISPER_MODELS[name]["mlx_repo"], cache_dir=str(root), allow_patterns=["config.json", *MLX_WEIGHT_FILES]
+    ))
+
+
+def require_metal() -> None:
+    """Raise the permanent GpuUnavailable when the Apple GPU engine cannot run on this machine
+    (with a hint about `--device auto` on a machine that is not an Apple Silicon Mac)."""
+    ok, why = metal_status(deep=False)
+    if not ok:
+        hint = None if apple_silicon() else METAL_NOT_MAC_HINT
+        raise GpuUnavailable(f"the Apple GPU engine {why}", permanent=True, hint=hint)
+
+
+def load_metal(model_name: str, root: Path) -> MetalModel:
+    """The model on the Apple GPU (float16, through mlx-whisper). An engine that cannot start
+    raises a permanent GpuUnavailable, a Metal or memory error a retryable one; there is no CPU
+    fallback. A failed weight download is a FetchError (never a GPU error), other errors pass
+    through, as on CUDA."""
+    require_metal()
+    try:
+        import mlx.core as mx
+        from mlx_whisper.transcribe import ModelHolder
+    except ImportError as exc:
+        raise GpuUnavailable(f"mlx-whisper is not installed in this environment ({exc})", permanent=True) from None
+    if not mx.metal.is_available():
+        raise GpuUnavailable("MLX sees no Metal GPU", permanent=True)
+    path = mlx_snapshot(model_name, root)
+    if path is None:
+        try:
+            path = download_mlx_model(model_name, root)
+        except Exception as exc:  # noqa: BLE001 - network, disk or hub errors
+            raise FetchError(
+                f"the Whisper model download failed ({type(exc).__name__}: {exc})", EXIT_ERROR, MODEL_DOWNLOAD_HINT
+            ) from None
+    try:
+        ModelHolder.get_model(str(path), mx.float16)  # load the weights now: errors surface before any audio work
+    except (RuntimeError, OSError, MemoryError) as exc:
+        if is_metal_error(exc):
+            message = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+            raise GpuUnavailable(message) from None
+        raise
+    return MetalModel(model_name, str(path))
+
+
+def release_whisper(model: Any) -> None:
+    """Free the Apple GPU engine's weights (mlx-whisper keeps the loaded model in a module-level
+    holder); a no-op for the other engines, which are released by dropping the reference."""
+    if not isinstance(model, MetalModel):
+        return
+    try:
+        import mlx.core as mx
+        from mlx_whisper.transcribe import ModelHolder
+
+        ModelHolder.model = ModelHolder.model_path = None
+        gc.collect()
+        mx.clear_cache()
+    except Exception:  # noqa: BLE001 - freeing memory must never fail a fetch
+        pass
+
+
+class SpeechTimeline:
+    """Maps seconds in the speech-only audio (the VAD chunks joined end to end) back to the
+    original timeline, like faster-whisper does for its sequential VAD runs."""
+
+    def __init__(self, chunks: Sequence[tuple[float, float]]):
+        self.chunks = list(chunks)  # (start, end) in seconds of the original audio
+        self.starts: list[float] = []  # where each chunk begins in the speech-only audio
+        total = 0.0
+        for start, end in self.chunks:
+            self.starts.append(total)
+            total += end - start
+        self.total = total
+
+    def original(self, t: float, is_end: bool = False) -> float:
+        """Original time of speech-only time `t`; a boundary belongs to the earlier chunk for an
+        end time and to the later chunk for a start time. Times past the speech (Whisper can
+        place the last timestamps after it) end at the last chunk's end."""
+        if not self.chunks:
+            return t
+        pos = bisect.bisect_left(self.starts, t) - 1 if is_end else bisect.bisect_right(self.starts, t) - 1
+        i = min(max(pos, 0), len(self.chunks) - 1)
+        start, end = self.chunks[i]
+        return min(end, start + max(0.0, t - self.starts[i]))
+
+
+def segments_from_mlx(raw: Sequence[dict[str, Any]], timeline: SpeechTimeline | None = None) -> list[Segment]:
+    """Segments (with word timestamps) from mlx-whisper's result, with times restored to the
+    original audio when a VAD run transcribed only the speech chunks."""
+    def at(t: float, is_end: bool = False) -> float:
+        return timeline.original(t, is_end) if timeline else t
+
+    segments: list[Segment] = []
+    for seg in raw:
+        text = str(seg.get("text", "")).strip()
+        if not text:
+            continue
+        words = [
+            {"start": round(at(w["start"]), 3), "end": round(at(w["end"], True), 3), "word": w["word"],
+             "p": round(float(w.get("probability", 0.0)), 3)}
+            for w in (seg.get("words") or [])
+        ]
+        segments.append(Segment(round(at(seg["start"]), 3), round(at(seg["end"], True), 3), text, words or None))
+    return segments
+
+
+def detect_language_mlx(model: Any, audio: Any) -> tuple[str | None, float | None]:
+    """(language, probability) from the first 30 s of `audio` (float32 samples at 16 kHz), the
+    same way mlx-whisper detects it, but with the probability. (None, None) when it fails; the
+    transcription then detects the language itself."""
+    try:
+        import mlx.core as mx
+        from mlx_whisper.audio import N_FRAMES, N_SAMPLES, log_mel_spectrogram, pad_or_trim
+
+        mel = log_mel_spectrogram(audio[:N_SAMPLES], n_mels=model.dims.n_mels, padding=N_SAMPLES)
+        _, probs = model.detect_language(pad_or_trim(mel, N_FRAMES, axis=-2).astype(mx.float16))
+        code = max(probs, key=probs.get)
+        return code, float(probs[code])
+    except Exception:  # noqa: BLE001 - detection is optional
+        return None, None
+
+
+class _ProgressLog:
+    """Stands in for the tqdm bar of mlx-whisper: a `transcribe: N% (mm:ss / mm:ss)` line on stderr
+    every 10 %, like the other engine (the real bar would print one long line of carriage returns)."""
+
+    def __init__(self, total: float = 0, unit_s: float = 0.01, **_: Any):
+        self.total, self.unit_s, self.done, self.next_report = total or 0, unit_s, 0.0, 10
+
+    def __enter__(self) -> "_ProgressLog":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def update(self, n: float = 1) -> None:
+        self.done += n
+        if self.total and 100 * self.done / self.total >= self.next_report:
+            pct = min(100, int(100 * self.done / self.total))
+            log(f"transcribe: {pct}% ({format_duration(self.done * self.unit_s)} / {format_duration(self.total * self.unit_s)})")
+            self.next_report = (pct // 10 + 1) * 10
+
+
+def transcribe_metal(
+    model: MetalModel, audio: Path, language: str | None, vad: bool, duration: float | None
+) -> tuple[list[Segment], TranscribeInfo, dict[str, Any]]:
+    """One transcription pass on the Apple GPU. With VAD, Silero VAD (faster-whisper's, the same as
+    on CUDA) cuts the silence and music out, mlx-whisper transcribes the speech chunks joined end to
+    end, and the times are mapped back; without VAD it decodes the whole audio. Greedy decoding
+    with temperature fallback (mlx-whisper has no beam search); word timestamps always on."""
+    import mlx.core as mx
+    import mlx_whisper
+    import numpy as np
+    from faster_whisper.audio import decode_audio
+    from mlx_whisper.transcribe import ModelHolder
+
+    samples = decode_audio(str(audio), sampling_rate=WHISPER_SAMPLE_RATE)
+    total_s = len(samples) / WHISPER_SAMPLE_RATE
+    timeline: SpeechTimeline | None = None
+    settings: dict[str, Any] = {"batched": False}
+    if vad:
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+        spans = get_speech_timestamps(samples, VadOptions(min_silence_duration_ms=VAD_MIN_SILENCE_MS))
+        if not spans:
+            return [], TranscribeInfo(language, None, total_s), settings
+        timeline = SpeechTimeline([(c["start"] / WHISPER_SAMPLE_RATE, c["end"] / WHISPER_SAMPLE_RATE) for c in spans])
+        samples = np.concatenate([samples[c["start"]:c["end"]] for c in spans])
+    probability = None
+    if not language:
+        language, probability = detect_language_mlx(ModelHolder.get_model(model.path, mx.float16), samples)
+    # mlx-whisper 0.4 draws its progress bar with `tqdm.tqdm(...)` in this module (the module, not the
+    # function that `mlx_whisper` re-exports); swap in the stderr log only when that is still so,
+    # otherwise run without a bar (verbose=None) instead of failing on a changed internal.
+    module = sys.modules.get("mlx_whisper.transcribe")
+    real_tqdm = getattr(module, "tqdm", None)
+    hooked = callable(getattr(real_tqdm, "tqdm", None))
+    if hooked:
+        module.tqdm = argparse.Namespace(tqdm=_ProgressLog)  # progress is in mel frames: 100 per second
+    try:
+        with contextlib.redirect_stdout(sys.stderr):  # stdout is the KEY: value contract; mlx-whisper may print
+            result = mlx_whisper.transcribe(
+                samples,
+                path_or_hf_repo=model.path,
+                language=language,
+                word_timestamps=True,
+                condition_on_previous_text=False,
+                verbose=False if hooked else None,
+            )
+    finally:
+        if hooked:
+            module.tqdm = real_tqdm
+    return segments_from_mlx(result["segments"], timeline), TranscribeInfo(
+        language or result.get("language"), probability, total_s
+    ), settings
+
+
 def transcribe(
     model: Any, audio: Path, language: str | None, vad: bool, duration: float | None, batch_size: int = BATCH_SIZE
 ) -> tuple[list[Segment], Any, dict[str, Any]]:
+    if isinstance(model, MetalModel):
+        return transcribe_metal(model, audio, language, vad, duration)
     from faster_whisper import BatchedInferencePipeline
 
     common = dict(
@@ -1928,13 +2281,16 @@ def prefer_retry(first: list[Segment], retry: list[Segment]) -> bool:
 def _transcribe_on_device(
     model: Any, audio: Path, language: str | None, vad: bool, duration: float | None, batch_size: int, device: str
 ) -> tuple[list[Segment], Any, dict[str, Any]]:
-    """transcribe(); on the GPU, CUDA errors and running out of memory become GpuUnavailable."""
+    """transcribe(); on the GPU, CUDA or Metal errors and running out of memory become GpuUnavailable."""
     if device == "cpu":
         return transcribe(model, audio, language, vad, duration, batch_size)
     try:
         return transcribe(model, audio, language, vad, duration, batch_size)
     except (RuntimeError, OSError, MemoryError) as exc:
-        if is_gpu_error(exc) or isinstance(exc, MemoryError):
+        if device == "metal" and is_metal_error(exc):
+            message = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+            raise GpuUnavailable(message) from None
+        if device != "metal" and (is_gpu_error(exc) or isinstance(exc, MemoryError)):
             raise gpu_unavailable(exc) from None
         raise
 
@@ -1971,6 +2327,8 @@ def whisper_estimate_min(
     """Expected wall-clock minutes of a Whisper fetch (without a first-time model download)."""
     if device == "cpu":
         factor = CPU_RTF.get(model, CPU_RTF[DEFAULT_MODEL]) * (CPU_SEQUENTIAL_SLOWDOWN if no_vad else 1)
+    elif device == "metal":
+        factor = METAL_RTF.get(model, METAL_RTF[DEFAULT_MODEL])  # the same with and without VAD
     else:
         slowdown = BATCH_SLOWDOWN.get(batch, 1.0) if model in BATCH_SENSITIVE_MODELS else 1.0
         speed = GPU_SPEED.get(model, 1.0) * (SEQUENTIAL_SLOWDOWN if no_vad else slowdown)
@@ -2012,13 +2370,15 @@ def run_whisper(
     device = resolve_device(args)
     root = model_dir(args)
     duration = info.get("duration") or 0
-    batch = CPU_BATCH_SIZE if device == "cpu" else choose_batch_size(model_name, gpu_free_mb())
+    if device == "metal":
+        require_metal()  # before the ESTIMATE: no estimate for an engine that cannot run on this machine
+    batch = CPU_BATCH_SIZE if device == "cpu" else 1 if device == "metal" else choose_batch_size(model_name, gpu_free_mb())
     estimate = whisper_estimate_min(duration, args.no_vad, model_name, device, batch)
-    first_use = not model_cached(model_name, root)
-    size_gb = WHISPER_MODELS[model_name]["size_mb"] / 1000
+    first_use = not model_cached(model_name, root, device)
+    size_gb = model_size_mb(model_name, device) / 1000
     extra = f" incl. first-time model download (~{size_gb:.1f} GB)" if first_use else ""
     estimate += MODEL_DOWNLOAD_EXTRA_MIN * min(1.0, size_gb / 3) if first_use else 0
-    where = "on the CPU, slow" if device == "cpu" else f"batch {batch}"
+    where = "on the CPU, slow" if device == "cpu" else "on the Apple GPU" if device == "metal" else f"batch {batch}"
     log(f"ESTIMATE: ~{estimate:.1f} min for {format_duration(duration)} of audio (whisper {model_name}, {where}{extra})")
 
     t0 = time.monotonic()
@@ -2067,20 +2427,24 @@ def run_whisper(
             log(f"no-VAD retry in {t_retry:.1f}s")
             t_transcribe += t_retry  # transcribe_s and the RTF cover both runs
     finally:
+        release_whisper(model)
         del model  # free the GPU before anything else (the sound map) runs
         gc.collect()
         if not keep_audio:
             remove_downloads(directory)
 
     if not lang:
-        notes.append(f"language auto-detected as '{winfo.language}' (p={winfo.language_probability:.2f})")
+        p = getattr(winfo, "language_probability", None)
+        notes.append(f"language auto-detected as '{winfo.language}'" + (f" (p={p:.2f})" if p is not None else ""))
     if device == "cpu":
         notes.append(f"transcribed on the CPU ({CPU_COMPUTE_TYPE}, device cpu): slower than a GPU, same model")
+    if device == "metal":
+        notes.append("transcribed on the Apple GPU (mlx-whisper, float16, greedy decoding instead of beam search)")
     settings = {
         "model": model_name,
         "device": device,
         "compute_type": CPU_COMPUTE_TYPE if device == "cpu" else COMPUTE_TYPE,
-        "beam_size": BEAM_SIZE,
+        "beam_size": 1 if device == "metal" else BEAM_SIZE,
         "vad_filter": vad,
         "vad_min_silence_ms": VAD_MIN_SILENCE_MS if vad else None,
         "vad_auto_retry": retried,
@@ -4041,7 +4405,7 @@ def _fetch(source: Source, directory: Path, args: argparse.Namespace) -> int:
                 log(f"whisper unavailable on GPU: {exc}")
                 if exc.no_cuda:  # no usable CUDA at all: never a silent fallback, CPU mode is the user's choice
                     raise FetchError(f"no usable CUDA GPU for Whisper ({exc})", EXIT_NO_TRANSCRIPT, exc.hint) from None
-                if not youtube:  # the auto-captions fallback is YouTube-only (its `-orig` tracks)
+                if not youtube or exc.permanent:  # the auto-captions fallback is YouTube-only (its `-orig` tracks)
                     raise FetchError(f"Whisper could not run on the GPU ({exc})", EXIT_NO_TRANSCRIPT, exc.hint) from None
                 track = choose_auto_track(info.get("automatic_captions") or {}, original_lang)
                 if not track:
@@ -4956,13 +5320,20 @@ def cmd_clean(args: argparse.Namespace) -> int:
 RECOMMEND_LARGE_MB = 7800
 RECOMMEND_TURBO_MB = 3900
 RECOMMEND_SOUNDS_MB = 6000
+ENGINE_LABELS = {
+    "cuda": "faster-whisper (CUDA, float16)",
+    "cpu": "faster-whisper (CPU, int8)",
+    "metal": "mlx-whisper (Apple GPU, float16)",
+}
 MIN_CUDA_DRIVER = 525  # CUDA 12 (CTranslate2 4.5+ wheels) needs driver 525 or newer
 WHISPER_ENV_SIZE_MB = {"win32": 1400, "linux": 1500, "darwin": 200}  # uv env of video_watch.py
+WHISPER_ENV_SIZE_APPLE_MB = 700  # the same on Apple Silicon (adds MLX and mlx-whisper)
 
 
 def heavy_env_present() -> bool:
     """True when this interpreter has the transcription packages (run as `uv run video_watch.py`)."""
-    return all(importlib.util.find_spec(name) is not None for name in ("faster_whisper", "ctranslate2", "yt_dlp"))
+    names = ("faster_whisper", "ctranslate2", "yt_dlp") + (("mlx_whisper",) if apple_silicon() else ())
+    return all(importlib.util.find_spec(name) is not None for name in names)
 
 
 @dataclass
@@ -5005,7 +5376,9 @@ def cuda_status(gpu: GpuInfo, platform: str | None = None, deep: bool | None = N
     """Whether Whisper can use CUDA here and why not. Read-only and without downloads: nvidia-smi
     and the driver version, plus CTranslate2's own device check when its package is installed."""
     if platform_key(platform) == "darwin":
-        return False, "macOS has no CUDA (CPU mode only; Metal is not supported yet)"
+        return False, "macOS has no CUDA" + (
+            " (Whisper runs on the Apple GPU instead)" if apple_silicon(platform) else " (CPU mode only)"
+        )
     if not gpu.name:
         return False, "no NVIDIA GPU or driver found (nvidia-smi is missing or failed)"
     driver_ok, why = driver_status(gpu)
@@ -5028,10 +5401,14 @@ def cuda_status(gpu: GpuInfo, platform: str | None = None, deep: bool | None = N
     return True, f"ok (driver {gpu.driver}, CTranslate2 {getattr(ctranslate2, '__version__', '?')})"
 
 
-def recommend(gpu: GpuInfo, cuda_ok: bool) -> tuple[str, str, bool, str]:
+def recommend(gpu: GpuInfo, cuda_ok: bool, apple_mb: int | None = None) -> tuple[str, str, bool, str]:
     """(model, device, sound map yes/no, reason for the sound map) for this machine. Only a
-    recommendation: any model can be chosen (with a WARN when it may not fit)."""
+    recommendation: any model can be chosen (with a WARN when it may not fit). `apple_mb` is the
+    unified memory of an Apple Silicon Mac whose GPU engine works."""
     total = gpu.total_mb or 0
+    if not cuda_ok and apple_mb:
+        model = "large-v3" if apple_mb >= METAL_RECOMMEND_LARGE_MB else "large-v3-turbo" if apple_mb >= METAL_RECOMMEND_TURBO_MB else "small"
+        return model, "metal", False, "it needs an NVIDIA GPU (CUDA)"
     if not cuda_ok:
         return "small", "cpu", False, "it needs an NVIDIA GPU (CUDA)"
     model = "large-v3" if total >= RECOMMEND_LARGE_MB else "large-v3-turbo" if total >= RECOMMEND_TURBO_MB else "small"
@@ -5058,6 +5435,19 @@ def model_fit_warning(model: str, total_mb: int | None) -> str | None:
         return (
             f"memory may be tight for {model} on {total_mb / 1024:.1f} GB of VRAM: it runs with a smaller batch "
             f"(slower) and fails while other apps hold VRAM"
+        )
+    return None
+
+
+def metal_fit_warning(model: str, total_mb: int | None) -> str | None:
+    """A WARN when the chosen model may not fit the unified memory of the Mac (never a refusal)."""
+    if not total_mb:
+        return None
+    peak = METAL_PEAK_MB.get(model, METAL_PEAK_MB[DEFAULT_MODEL])
+    if peak + METAL_MARGIN_MB > total_mb:
+        return (
+            f"{model} needs about {peak / 1024:.1f} GB of memory on the Apple GPU; this Mac has {total_mb / 1024:.0f} GB "
+            "shared with the system, so it may run out of memory (large-v3-turbo or small fit better)"
         )
     return None
 
@@ -5116,11 +5506,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "transcripts of URLs work without them"
         )
     gpu = gpu_info()
-    out.append(f"GPU: {f'{gpu.name} (driver {gpu.driver})' if gpu.name else 'none'}")
-    out.append(f"VRAM_TOTAL_MB: {gpu.total_mb if gpu.total_mb is not None else 'unknown'}")
-    out.append(f"VRAM_FREE_MB: {gpu.free_mb if gpu.free_mb is not None else 'unknown'}")
+    apple = apple_gpu_info() if not gpu.name else GpuInfo()  # an Apple Silicon Mac has no NVIDIA GPU
+    if gpu.name:
+        gpu_line = f"{gpu.name} (driver {gpu.driver})"
+    elif apple_silicon():
+        gpu_line = f"{apple.name or 'Apple Silicon'} (Apple GPU, unified memory)"
+    else:
+        gpu_line = "none"
+    memory = gpu if gpu.name else apple  # unified memory stands in for VRAM on a Mac
+    out.append(f"GPU: {gpu_line}")
+    out.append(f"VRAM_TOTAL_MB: {memory.total_mb if memory.total_mb is not None else 'unknown'}")
+    out.append(f"VRAM_FREE_MB: {memory.free_mb if memory.free_mb is not None else 'unknown'}")
     cuda_ok, cuda_reason = cuda_status(gpu)
     out.append(f"CUDA: {cuda_reason if cuda_ok else 'unavailable: ' + cuda_reason}")
+    metal_ok, metal_reason = metal_status()
+    out.append(f"METAL: {metal_reason if metal_ok else 'unavailable: ' + metal_reason}")
 
     path = config_path()
     try:
@@ -5137,7 +5537,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             values[key] = default_setting(key)
     root = Path(values["model_dir"])
     sound_cache = Path(values["sound_cache"]) if values["sound_cache"] else hf_cache_dir()
-    model_ok = model_cached(values["model"], root)
+    device = effective_device(values["device"])
+    model_ok = model_cached(values["model"], root, device)
     sound_ok = sound_model_cached_in(sound_cache)
     helper_ok = sound_helper_ready()
     free_gb = disk_free_gb(root)
@@ -5145,6 +5546,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         f"DISK_FREE_GB: {free_gb if free_gb is not None else 'unknown'}",
         f"CONFIG: {path}{'' if path.is_file() else ' (not created yet)'}",
         f"DEVICE: {values['device']}",
+        f"ENGINE: {ENGINE_LABELS[device]}",
         f"MODEL: {values['model']}",
         f"MODEL_DIR: {root}",
         f"MODEL_CACHED: {'yes' if model_ok else 'no'}",
@@ -5153,29 +5555,35 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         f"SOUND_HELPER_READY: {'yes' if helper_ok else 'no'}",
         f"WORK_DIR: {values['work_dir']}",
     ]
-    rec_model, rec_device, rec_sounds, why = recommend(gpu, cuda_ok)
+    rec_model, rec_device, rec_sounds, why = recommend(gpu, cuda_ok, apple.total_mb if metal_ok else None)
     out += [
         f"RECOMMEND_MODEL: {rec_model}",
         f"RECOMMEND_DEVICE: {rec_device}",
         f"RECOMMEND_SOUNDS: {'yes' if rec_sounds else 'no'} ({why})",
     ]
-    device = values["device"]
-    device_ok = device == "cpu" or cuda_ok
+    device_ok = device == "cpu" or (cuda_ok if device == "cuda" else metal_ok)
     if not device_ok:
+        what = "the Apple GPU engine is" if device == "metal" else "CUDA is"
+        why_not = metal_reason if device == "metal" else cuda_reason
         warns.append(
-            f"device is {device} but CUDA is unavailable ({cuda_reason}); fetch would stop with an error. "
+            f"device is {values['device']} but {what} unavailable ({why_not}); fetch would stop with an error. "
             "CPU mode is slow but works: setup --device cpu --model small"
         )
     if device == "cpu":
-        warns.append("device is cpu: transcription is several times slower than on an NVIDIA GPU")
-    elif cuda_ok:
+        faster = "the Apple GPU (setup --device metal)" if metal_ok else "an NVIDIA GPU"
+        warns.append(f"device is cpu: transcription is several times slower than on {faster}")
+    elif device == "metal" and metal_ok:
+        fit = metal_fit_warning(values["model"], apple.total_mb)
+        if fit:
+            warns.append(fit)
+    elif device == "cuda" and cuda_ok:
         fit = model_fit_warning(values["model"], gpu.total_mb)
         if fit:
             warns.append(fit)
         if gpu.free_mb is not None and gpu.free_mb < model_vram_mb(values["model"], 1) + VRAM_MARGIN_MB:
             warns.append(f"only {gpu.free_mb} MB of VRAM are free right now; close other GPU apps before a fetch")
     if not model_ok:
-        size = WHISPER_MODELS[values["model"]]["size_mb"] / 1000
+        size = model_size_mb(values["model"], device) / 1000
         warns.append(f"the Whisper model {values['model']} is not downloaded yet (about {size:.1f} GB; setup downloads it)")
     if values["sounds"]:
         if not gpu.name:
@@ -5247,11 +5655,21 @@ def cmd_setup(args: argparse.Namespace) -> int:
         raise FetchError(f"invalid setup request: {exc}", EXIT_ERROR, "see: setup --help") from None
     gpu = gpu_info()
     cuda_ok, cuda_reason = cuda_status(gpu)
-    if device != "cpu" and not cuda_ok:
+    engine = effective_device(device)  # cuda, metal or cpu
+    if engine == "metal":
+        metal_ok, metal_reason = metal_status()
+        if not metal_ok:
+            raise FetchError(
+                f"the Apple GPU engine is unavailable for device {device}: {metal_reason}",
+                EXIT_ERROR,
+                "CPU mode is slow but works everywhere: setup --device cpu --model small --sounds off",
+            )
+    elif engine != "cpu" and not cuda_ok:
         raise FetchError(
             f"CUDA is unavailable for device {device}: {cuda_reason}",
             EXIT_ERROR,
-            "CPU mode is slow but works without an NVIDIA GPU: setup --device cpu --model small --sounds off",
+            "CPU mode is slow but works without an NVIDIA GPU: setup --device cpu --model small --sounds off"
+            + (" (or --device metal for the Apple GPU)" if apple_silicon() else ""),
         )
     if sounds:
         if not gpu.name:
@@ -5269,11 +5687,15 @@ def cmd_setup(args: argparse.Namespace) -> int:
     sound_cache = sound_cache_dir()
     downloads: list[tuple[str, int]] = []
     if not heavy_env_present():
-        size = WHISPER_ENV_SIZE_MB[platform_key()]
-        downloads.append((f"python packages of video_watch.py (yt-dlp, faster-whisper{', CUDA libraries' if platform_key() != 'darwin' else ''}) into the uv cache (less if uv already has them)", size))
-    whisper_needed = not model_cached(model, root)
+        if apple_silicon():
+            size, libs = WHISPER_ENV_SIZE_APPLE_MB, ", mlx-whisper"
+        else:
+            size, libs = WHISPER_ENV_SIZE_MB[platform_key()], ", CUDA libraries" if platform_key() != "darwin" else ""
+        downloads.append((f"python packages of video_watch.py (yt-dlp, faster-whisper{libs}) into the uv cache (less if uv already has them)", size))
+    whisper_needed = not model_cached(model, root, engine)
     if whisper_needed:
-        downloads.append((f"whisper model {model} into {root}", WHISPER_MODELS[model]["size_mb"]))
+        weights = " (MLX weights for the Apple GPU)" if engine == "metal" else ""
+        downloads.append((f"whisper model {model}{weights} into {root}", model_size_mb(model, engine)))
     env_needed = bool(sounds) and not sound_helper_ready()
     model_needed = bool(sounds) and not sound_model_cached()
     if env_needed:
@@ -5295,10 +5717,13 @@ def cmd_setup(args: argparse.Namespace) -> int:
         *[f"DOWNLOAD: {what}, about {mb / 1000:.1f} GB" for what, mb in downloads],
         f"DOWNLOAD_TOTAL_GB: {total_gb:.1f}",
     ]
-    warn = model_fit_warning(model, gpu.total_mb) if device != "cpu" else None
+    warn = (
+        metal_fit_warning(model, apple_gpu_info().total_mb) if engine == "metal"
+        else model_fit_warning(model, gpu.total_mb) if engine != "cpu" else None
+    )
     out += [f"WARN: {warn}"] if warn else []
-    if device == "cpu":
-        out.append("WARN: CPU mode is several times slower than an NVIDIA GPU")
+    if engine == "cpu":
+        out.append("WARN: CPU mode is several times slower than a GPU")
     free_gb = disk_free_gb(root)
     if free_gb is not None and free_gb < total_gb + 1:
         out.append(f"WARN: only {free_gb} GB free on the model drive")
@@ -5323,14 +5748,14 @@ def cmd_setup(args: argparse.Namespace) -> int:
         cmd = [uv, "run", "--script", str(Path(__file__).resolve()), *getattr(args, "argv", sys.argv[1:])]
         return subprocess.run(cmd, check=False).returncode
     if whisper_needed:
-        log(f"downloading whisper {model} (about {WHISPER_MODELS[model]['size_mb'] / 1000:.1f} GB) into {root}")
+        log(f"downloading whisper {model} (about {model_size_mb(model, engine) / 1000:.1f} GB) into {root}")
         try:
-            download_whisper_model(model, root)
+            download_mlx_model(model, root) if engine == "metal" else download_whisper_model(model, root)
         except Exception as exc:  # noqa: BLE001 - network, disk or hub errors
             raise FetchError(f"the Whisper model download failed ({type(exc).__name__}: {exc})", EXIT_ERROR, "check the network and disk space, then rerun setup") from None
-        if not model_cached(model, root):
+        if not model_cached(model, root, engine):
             raise FetchError(f"the Whisper model {model} is still missing after the download", EXIT_ERROR, "rerun setup")
-    print(f"MODEL_CACHED: {'yes' if model_cached(model, root) else 'no'}", flush=True)
+    print(f"MODEL_CACHED: {'yes' if model_cached(model, root, engine) else 'no'}", flush=True)
     if sounds and (env_needed or model_needed):
         log("preparing the sound map: PyTorch environment and model (first time about 5 GB)")
         try:
@@ -5438,7 +5863,7 @@ def build_parser() -> argparse.ArgumentParser:
     fetch.add_argument("--lang", help="override the original spoken language (e.g. tr, en)")
     fetch.add_argument("--no-vad", action="store_true", help="disable VAD (sequential, slower)")
     fetch.add_argument("--model", choices=MODEL_NAMES, help="Whisper model (default: config, else large-v3)")
-    fetch.add_argument("--device", choices=DEVICES, help="auto or cuda (NVIDIA GPU) or cpu (slow); default: config, else auto")
+    fetch.add_argument("--device", choices=DEVICES, help="auto (the GPU: NVIDIA, or the Apple GPU on Apple Silicon), cuda, metal (Apple GPU) or cpu (slow); default: config, else auto")
     sound_flags = fetch.add_mutually_exclusive_group()
     sound_flags.add_argument("--sounds", action="store_const", const=True, default=None, help="build the sound map for this run")
     sound_flags.add_argument("--no-sounds", action="store_true", help="skip the sound map for this run")
@@ -5485,7 +5910,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.set_defaults(func=cmd_doctor)
 
     setup = sub.add_parser("setup", help="apply choices: write the config and pre-download the models")
-    setup.add_argument("--device", choices=DEVICES, help="auto (GPU), cuda (GPU) or cpu (slow)")
+    setup.add_argument("--device", choices=DEVICES, help="auto (the GPU: NVIDIA, or the Apple GPU on Apple Silicon), cuda, metal (Apple GPU) or cpu (slow)")
     setup.add_argument("--model", choices=MODEL_NAMES, help="Whisper model")
     setup.add_argument("--sounds", choices=("on", "off"), help="the sound map (NVIDIA GPU, about 5 GB download)")
     setup.add_argument("--model-dir", metavar="PATH", help="where Whisper models are stored")

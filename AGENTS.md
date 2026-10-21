@@ -62,8 +62,9 @@ uv run skills/video-watch/scripts/video_watch.py clean --all
   - sound labels are acoustic cues, not emotions; no emotion model;
   - sound-map thresholds change only with a new calibration documented in `docs/DESIGN.md`.
 - **Dependencies** belong in the PEP 723 headers. No global installs (`pip install` into system
-  Python, `uv tool install`, system package managers) during development. Keep the `av<16` pin and
-  the CUDA 12.8 PyTorch index unless you have tested a replacement on real hardware.
+  Python, `uv tool install`, system package managers) during development. Keep the `av<16` pin,
+  the CUDA 12.8 PyTorch index, and the `mlx-whisper<0.5` pin with its `torch` override (the Apple
+  GPU engine) unless you have tested a replacement on real hardware.
 - **No hard-coded machine paths.** Use the config, platform directories and `tempfile`.
 - **No personal data.** Never commit cookies, tokens, downloaded media, model files, transcripts of
   private videos, or user names and paths from your machine. Use neutral public test videos.

@@ -18,16 +18,17 @@ the approach.
       mode; a Whisper batch size that adapts to the free VRAM (large-v3 on 6-8 GB cards).
 - [x] Portable Agent Skill, `npx skills add`, Claude Code plugin, agent-guided install.
 - [x] Unit tests in CI on Windows, Linux and macOS.
+- [x] **macOS GPU (Apple Silicon / Metal).** A second Whisper engine, mlx-whisper, runs on the Apple
+      GPU (`device: auto` on an arm64 Mac), chosen over whisper.cpp from measurements on an M5 Pro;
+      see [Apple Silicon engine](docs/DESIGN.md#apple-silicon-engine).
+- [x] **macOS CPU mode verified** on an Apple M5 Pro (`doctor`, `setup`, `fetch` with the small
+      model, frames).
 
 ## Not supported yet: help wanted
 
 These need people with the hardware. Each has an issue draft with context, a suggested approach and
 acceptance criteria in [`docs/help-wanted/`](docs/help-wanted/).
 
-- [ ] **macOS GPU (Apple Silicon / Metal).** faster-whisper's CTranslate2 backend runs on CUDA or
-      the CPU only, so Macs run in slow CPU mode today. A second Whisper engine is needed, for
-      example MLX Whisper or whisper.cpp with Metal (unverified which fits best).
-      [Draft](docs/help-wanted/macos-gpu.md)
 - [ ] **AMD and Intel GPUs.** Same gap on Windows and Linux. Candidates: whisper.cpp with Vulkan
       (both vendors), ROCm builds for AMD on Linux (unverified). [Draft](docs/help-wanted/amd-intel-gpu.md)
 - [ ] **Sound map on the CPU or Apple Silicon.** The helper uses PyTorch with CUDA only. A CPU or
@@ -36,8 +37,9 @@ acceptance criteria in [`docs/help-wanted/`](docs/help-wanted/).
 - [ ] **Verify frame reading in OpenCode and IDE extensions.** Verified in Claude Code, Codex CLI
       and Kilo CLI; OpenCode with a vision model and the IDE extensions are not checked yet.
       [Draft](docs/help-wanted/agent-image-reading.md)
-- [ ] **Verify CPU mode on macOS and CUDA on native Linux.** macOS CPU mode is expected to work but
-      has not been run on a Mac; Linux CUDA was verified on WSL (Arch Linux) with `small` only.
+- [ ] **Verify CUDA on native Linux, and the Apple GPU engine on other chips and Intel Macs.** Linux
+      CUDA was verified on WSL (Arch Linux) with `small` only; the Apple GPU engine and macOS CPU
+      mode were measured on one Apple M5 Pro (24 GB) only.
       A [platform report](https://github.com/AAyberkU/video-watch/issues/new?template=platform_support.yml)
       with `doctor` output and timings is enough.
 
