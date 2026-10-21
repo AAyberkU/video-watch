@@ -7,6 +7,8 @@ names may still change between minor versions; every such change is listed here.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-21
+
 ### Apple Silicon
 
 - Whisper now runs on the GPU of Apple Silicon Macs through mlx-whisper (MLX), contributed by
@@ -130,4 +132,6 @@ version collects that work under a new name and makes it portable.
   per-user ffmpeg and uv installs and has no network).
 - Frame reading in OpenCode and in IDE extensions is not verified yet.
 
+[Unreleased]: https://github.com/AAyberkU/video-watch/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/AAyberkU/video-watch/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/AAyberkU/video-watch/releases/tag/v0.1.0

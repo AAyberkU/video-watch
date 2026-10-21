@@ -1,6 +1,6 @@
 {
   "name": "video-watch",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Lets Claude watch videos locally: transcript (subtitles or local Whisper), an optional sound map, and timestamped frames from YouTube, TikTok, Instagram, X, any yt-dlp site, and local files. Nothing is uploaded.",
   "author": {
     "name": "AAyberk",

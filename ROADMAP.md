@@ -4,7 +4,7 @@ Where video-watch is and where it could go. Items under "help wanted" are the bi
 are not decided and may never happen. Open an issue before starting large work so we can agree on
 the approach.
 
-## Shipped (0.1.0)
+## Shipped (0.1.0 and 0.2.0)
 
 - [x] Transcripts from manual subtitles or local Whisper (`large-v3` by default, other models
       selectable), with a strict source policy and the source always stated.
@@ -18,7 +18,7 @@ the approach.
       mode; a Whisper batch size that adapts to the free VRAM (large-v3 on 6-8 GB cards).
 - [x] Portable Agent Skill, `npx skills add`, Claude Code plugin, agent-guided install.
 - [x] Unit tests in CI on Windows, Linux and macOS.
-- [x] **macOS GPU (Apple Silicon / Metal).** A second Whisper engine, mlx-whisper, runs on the Apple
+- [x] **macOS GPU (Apple Silicon / Metal), 0.2.0, by @Bilaxten.** A second Whisper engine, mlx-whisper, runs on the Apple
       GPU (`device: auto` on an arm64 Mac), chosen over whisper.cpp from measurements on an M5 Pro;
       see [Apple Silicon engine](docs/DESIGN.md#apple-silicon-engine).
 - [x] **macOS CPU mode verified** on an Apple M5 Pro (`doctor`, `setup`, `fetch` with the small
