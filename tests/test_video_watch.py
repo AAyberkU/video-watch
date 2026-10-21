@@ -15,6 +15,7 @@ from video_watch import Segment  # noqa: E402
 
 
 _REAL_BLOCKED = yt.blocked_executable
+_REAL_APPLE_SILICON = yt.apple_silicon
 
 
 @pytest.fixture(autouse=True)
@@ -27,6 +28,7 @@ def _isolated(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPath
     monkeypatch.setattr(yt, "SOUND_MAP_DEFAULT", False)
     monkeypatch.setattr(yt, "gpu_free_mb", lambda: None)  # never ask the real nvidia-smi
     monkeypatch.setattr(yt, "blocked_executable", lambda name: None)  # never scan the real PATH
+    monkeypatch.setattr(yt, "apple_silicon", lambda platform=None, machine=None: False)  # tests choose their platform
     monkeypatch.setattr(yt, "sound_model_cached", lambda: True)  # the sound map counts as set up
     marker = tmp_path_factory.mktemp("helper") / "sound-helper.json"
     monkeypatch.setattr(yt, "sound_helper_marker", lambda: marker)  # never the real user cache
@@ -2927,7 +2929,7 @@ def test_config_validation_errors(monkeypatch: pytest.MonkeyPatch) -> None:
         yt.parse_config_value("sounds", "maybe")
     assert yt.parse_config_value("device", "CPU") == "cpu"
     assert yt.parse_config_value("sounds", "yes") is True and yt.parse_config_value("sounds", False) is False
-    monkeypatch.setenv("VIDEO_WATCH_DEVICE", "metal")
+    monkeypatch.setenv("VIDEO_WATCH_DEVICE", "vulkan")  # not an engine (yet)
     with pytest.raises(yt.ConfigError, match="VIDEO_WATCH_DEVICE"):
         yt.resolve_setting("device")
     _config_file().write_text("{not json", encoding="utf-8")
@@ -3534,7 +3536,7 @@ def test_hints_use_the_light_form_and_the_reference(monkeypatch: pytest.MonkeyPa
 def test_an_invalid_env_var_hint_names_the_variable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setenv("VIDEO_WATCH_DEVICE", "metal")
+    monkeypatch.setenv("VIDEO_WATCH_DEVICE", "vulkan")  # not an engine (yet)
     assert _run_main(monkeypatch, tmp_path, ["clean", "--all"]) == yt.EXIT_ERROR
     out = capsys.readouterr().out.splitlines()
     assert out[1] == "HINT: fix or unset the environment variable VIDEO_WATCH_DEVICE; it overrides the config file"
@@ -3659,3 +3661,504 @@ def test_doctor_shows_a_blocked_ffmpeg(monkeypatch: pytest.MonkeyPatch, capsys: 
     assert keys["FFMPEG"] == ["blocked: /opt/ffmpeg/ffmpeg (Permission denied)"]
     assert keys["FFPROBE"] == ["blocked: /opt/ffmpeg/ffprobe (Permission denied)"]
     assert any(w.startswith("ffmpeg was found but cannot be run by this process; the agent's sandbox") for w in keys["WARN"])
+
+
+# --- Apple GPU engine (mlx-whisper) --------------------------------------------------------------
+# No Mac, no MLX and no numpy needed: the engine's modules are faked.
+
+
+def _apple(monkeypatch: pytest.MonkeyPatch, on: bool = True) -> None:
+    monkeypatch.setattr(yt, "apple_silicon", lambda platform=None, machine=None: on)
+
+
+def _mlx_snapshot(root: Path, name: str, weights: str = "weights.safetensors") -> Path:
+    snap = yt.model_cache_path(name, root, "metal") / "snapshots" / "abc"
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text("{}")
+    (snap / weights).write_bytes(b"x")
+    return snap
+
+
+class _FakeHolder:
+    loaded: list[str] = []
+    model: object | None = None
+    model_path: str | None = None
+
+    @classmethod
+    def get_model(cls, path: str, dtype: object) -> object:
+        if cls.model is None or cls.model_path != path:
+            cls.loaded.append(path)
+            cls.model, cls.model_path = object(), path
+        return cls.model
+
+
+def _fake_mlx(monkeypatch: pytest.MonkeyPatch, metal: bool = True, transcribe: object = None) -> argparse.Namespace:
+    """Fake `mlx.core`, `mlx_whisper` and `mlx_whisper.transcribe` (with a tqdm hook) in sys.modules."""
+    import types
+
+    state = argparse.Namespace(holder=_FakeHolder, cleared=[], calls=[])
+    _FakeHolder.loaded, _FakeHolder.model, _FakeHolder.model_path = [], None, None
+    core = types.ModuleType("mlx.core")
+    core.float16 = "float16"
+    core.metal = argparse.Namespace(is_available=lambda: metal)
+    core.clear_cache = lambda: state.cleared.append(1)
+    mlx = types.ModuleType("mlx")
+    mlx.core = core
+    module = types.ModuleType("mlx_whisper.transcribe")
+    module.ModelHolder = _FakeHolder
+    module.tqdm = argparse.Namespace(tqdm=None)
+    package = types.ModuleType("mlx_whisper")
+
+    def run(samples: object, **kw: object) -> dict:
+        state.calls.append((len(samples), kw, module.tqdm.tqdm))
+        return transcribe(samples, **kw) if transcribe else {"segments": [], "text": "", "language": kw["language"]}
+
+    package.transcribe = run
+    for name, mod in (("mlx", mlx), ("mlx.core", core), ("mlx_whisper", package), ("mlx_whisper.transcribe", module)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    return state
+
+
+def test_device_auto_means_the_apple_gpu_only_on_apple_silicon(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert yt.effective_device("auto") == "cuda" and yt.effective_device("cuda") == "cuda"
+    _apple(monkeypatch)
+    assert yt.effective_device("auto") == "metal" and yt.effective_device("metal") == "metal"
+    assert yt.effective_device("cpu") == "cpu" and yt.effective_device("cuda") == "cuda"  # explicit choices are kept
+    assert yt.resolve_device(argparse.Namespace(device=None)) == "metal"
+    assert yt.resolve_device(argparse.Namespace(device="cpu")) == "cpu"  # CPU mode stays the user's choice
+    assert yt.parse_config_value("device", "Metal") == "metal"
+
+
+def test_apple_silicon_detection_by_platform_and_machine() -> None:
+    assert _REAL_APPLE_SILICON("darwin", "arm64") and _REAL_APPLE_SILICON("darwin", "ARM64")
+    assert not _REAL_APPLE_SILICON("darwin", "x86_64")  # an Intel Mac, or Python under Rosetta
+    assert not _REAL_APPLE_SILICON("linux", "aarch64") and not _REAL_APPLE_SILICON("win32", "arm64")
+
+
+def test_mlx_model_cache_layout_and_sizes(tmp_path: Path) -> None:
+    assert not yt.model_cached("small", tmp_path, "metal")
+    assert yt.model_cache_path("small", tmp_path, "metal").name == "models--mlx-community--whisper-small-mlx"
+    assert yt.model_cache_path("small", tmp_path).name == "models--Systran--faster-whisper-small"
+    snap = yt.model_cache_path("small", tmp_path, "metal") / "snapshots" / "abc"
+    snap.mkdir(parents=True)
+    (snap / "weights.npz").write_bytes(b"x")
+    assert not yt.model_cached("small", tmp_path, "metal")  # no config.json yet
+    (snap / "config.json").write_text("{}")
+    assert yt.model_cached("small", tmp_path, "metal") and yt.mlx_snapshot("small", tmp_path) == snap
+    assert not yt.model_cached("small", tmp_path)  # the CTranslate2 conversion is separate
+    assert yt.model_size_mb("small", "metal") == 481 and yt.model_size_mb("small", "cuda") == 485
+    _mlx_snapshot(tmp_path, "large-v3-turbo")
+    assert yt.model_cached("large-v3-turbo", tmp_path, "metal")
+    assert all(m["mlx_repo"].startswith("mlx-community/whisper-") for m in yt.WHISPER_MODELS.values())
+
+
+def test_download_mlx_model_fetches_config_and_weights_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen: dict = {}
+
+    def snapshot_download(repo: str, **kw: object) -> str:
+        seen.update(kw, repo=repo)
+        return str(tmp_path / "snap")
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", argparse.Namespace(snapshot_download=snapshot_download))
+    assert yt.download_mlx_model("small", tmp_path / "m") == tmp_path / "snap"
+    assert seen["repo"] == "mlx-community/whisper-small-mlx" and seen["cache_dir"] == str(tmp_path / "m")
+    assert seen["allow_patterns"] == ["config.json", "weights.safetensors", "weights.npz"]
+
+
+def test_metal_status_reasons(monkeypatch: pytest.MonkeyPatch) -> None:
+    ok, why = yt.metal_status()
+    assert not ok and "macOS on Apple Silicon" in why
+    _apple(monkeypatch)
+    ok, why = yt.metal_status(deep=False)
+    assert ok and "mlx-whisper is checked on the first run" in why
+    monkeypatch.setattr(yt.importlib.metadata, "version", lambda name: "0.4.3")
+    _fake_mlx(monkeypatch, metal=False)
+    assert yt.metal_status(deep=True) == (False, "MLX sees no Metal GPU")
+    _fake_mlx(monkeypatch)
+    assert yt.metal_status(deep=True) == (True, "ok (mlx-whisper 0.4.3, Metal)")
+    monkeypatch.setitem(sys.modules, "mlx.core", None)  # import fails
+    ok, why = yt.metal_status(deep=True)
+    assert not ok and why.startswith("MLX could not start")
+
+
+def test_load_metal_loads_the_cached_snapshot_without_downloading(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _apple(monkeypatch)
+    state = _fake_mlx(monkeypatch)
+    snap = _mlx_snapshot(tmp_path, "small")
+    monkeypatch.setattr(yt, "download_mlx_model", lambda *a: pytest.fail("cached: no download"))
+    model = yt.load_whisper("small", "metal", tmp_path)
+    assert model == yt.MetalModel("small", str(snap)) and state.holder.loaded == [str(snap)]
+
+
+def test_load_metal_downloads_a_missing_model_into_the_model_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _apple(monkeypatch)
+    state = _fake_mlx(monkeypatch)
+    snap = tmp_path / "fresh"
+    monkeypatch.setattr(yt, "download_mlx_model", lambda name, root: snap)
+    assert yt.load_whisper("small", "metal", tmp_path).path == str(snap)
+    assert state.holder.loaded == [str(snap)]
+
+
+def test_load_metal_failures_are_gpu_unavailable_never_a_cpu_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    with pytest.raises(yt.GpuUnavailable, match="macOS on Apple Silicon") as exc:  # not a Mac with an Apple chip
+        yt.load_whisper("small", "metal", tmp_path)
+    assert exc.value.permanent and exc.value.hint == yt.METAL_HINT and "--device cpu" in yt.METAL_HINT
+    _apple(monkeypatch)
+    monkeypatch.setitem(sys.modules, "mlx.core", None)
+    with pytest.raises(yt.GpuUnavailable, match="mlx-whisper is not installed") as exc:
+        yt.load_whisper("small", "metal", tmp_path)
+    assert exc.value.permanent
+    _fake_mlx(monkeypatch, metal=False)
+    with pytest.raises(yt.GpuUnavailable, match="no Metal GPU") as exc:
+        yt.load_whisper("small", "metal", tmp_path)
+    assert exc.value.permanent
+    state = _fake_mlx(monkeypatch)
+    _mlx_snapshot(tmp_path, "small")
+
+    def boom(path: str, dtype: object) -> None:
+        raise RuntimeError("[metal::malloc] Attempting to allocate too much memory")
+
+    monkeypatch.setattr(state.holder, "get_model", boom)
+    with pytest.raises(yt.GpuUnavailable, match="too much memory") as exc:  # a busy or full GPU: not permanent
+        yt.load_whisper("small", "metal", tmp_path)
+    assert not exc.value.permanent and exc.value.hint == yt.GPU_RETRY_HINT
+
+
+def test_release_whisper_frees_the_metal_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    state = _fake_mlx(monkeypatch)
+    model = yt.MetalModel("small", str(tmp_path))
+    state.holder.get_model(model.path, None)
+    yt.release_whisper(model)
+    assert state.holder.model is None and state.cleared == [1]
+    yt.release_whisper(object())  # the other engines are released by dropping the reference
+    assert state.cleared == [1]
+
+
+def test_speech_timeline_maps_joined_speech_back_to_the_original_audio() -> None:
+    timeline = yt.SpeechTimeline([(1.0, 3.0), (6.0, 8.0), (20.0, 21.0)])  # joined: 0-2, 2-4, 4-5
+    assert timeline.total == 5.0
+    assert timeline.original(0.0) == 1.0 and timeline.original(1.5) == 2.5
+    assert timeline.original(2.0) == 6.0  # a start on the boundary belongs to the later chunk
+    assert timeline.original(2.0, is_end=True) == 3.0  # an end on the boundary to the earlier one
+    assert timeline.original(3.5) == 7.5 and timeline.original(5.0, is_end=True) == 21.0
+    assert timeline.original(9.0, is_end=True) == 21.0 and yt.SpeechTimeline([]).original(1.5) == 1.5
+
+
+def test_segments_from_mlx_keep_word_timestamps_and_restore_times() -> None:
+    raw = [
+        {"start": 0.5, "end": 1.5, "text": " Merhaba dünya", "words": [
+            {"word": " Merhaba", "start": 0.5, "end": 1.0, "probability": 0.91234},
+            {"word": " dünya", "start": 1.0, "end": 1.5, "probability": 0.8},
+        ]},
+        {"start": 1.5, "end": 1.9, "text": "  ", "words": []},  # blank: dropped
+        {"start": 2.5, "end": 3.5, "text": "bir şey"},
+    ]
+    plain = yt.segments_from_mlx(raw)
+    assert [(s.start, s.end, s.text) for s in plain] == [(0.5, 1.5, "Merhaba dünya"), (2.5, 3.5, "bir şey")]
+    assert plain[0].words == [
+        {"start": 0.5, "end": 1.0, "word": " Merhaba", "p": 0.912}, {"start": 1.0, "end": 1.5, "word": " dünya", "p": 0.8}
+    ] and plain[1].words is None
+    mapped = yt.segments_from_mlx(raw, yt.SpeechTimeline([(10.0, 12.0), (30.0, 32.0)]))
+    assert (mapped[0].start, mapped[0].end) == (10.5, 11.5) and mapped[0].words[1]["end"] == 11.5
+    assert (mapped[1].start, mapped[1].end) == (30.5, 31.5)  # 2.5 s of speech is 0.5 s into the second chunk
+
+
+def _fake_audio_stack(monkeypatch: pytest.MonkeyPatch, seconds: int, spans: list[tuple[int, int]]) -> argparse.Namespace:
+    """faster_whisper.audio / .vad and numpy faked with plain lists (16 kHz samples)."""
+    import types
+
+    seen = argparse.Namespace(vad_calls=0)
+    audio = types.ModuleType("faster_whisper.audio")
+    audio.decode_audio = lambda path, sampling_rate=16000: [0.0] * (seconds * sampling_rate)
+    vad = types.ModuleType("faster_whisper.vad")
+    vad.VadOptions = lambda **kw: argparse.Namespace(**kw)
+
+    def speech(samples: object, options: object) -> list[dict]:
+        seen.vad_calls += 1
+        seen.options = options
+        return [{"start": a * 16000, "end": b * 16000} for a, b in spans]
+
+    vad.get_speech_timestamps = speech
+    for name, mod in (("faster_whisper", types.ModuleType("faster_whisper")), ("faster_whisper.audio", audio), ("faster_whisper.vad", vad)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setitem(sys.modules, "numpy", argparse.Namespace(concatenate=lambda parts: [x for part in parts for x in part]))
+    return seen
+
+
+def test_transcribe_metal_with_vad_decodes_only_the_speech_and_maps_the_times_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state = _fake_mlx(monkeypatch, transcribe=lambda samples, **kw: {"language": kw["language"], "segments": [
+        {"start": 0.5, "end": 1.5, "text": "bir", "words": [{"word": "bir", "start": 0.5, "end": 1.5, "probability": 0.9}]},
+        {"start": 2.5, "end": 3.5, "text": "iki", "words": [{"word": "iki", "start": 2.5, "end": 3.5, "probability": 0.9}]},
+    ]})
+    seen = _fake_audio_stack(monkeypatch, 10, [(1, 3), (6, 8)])
+    monkeypatch.setattr(yt, "detect_language_mlx", lambda model, samples: ("tr", 0.97) if len(samples) == 64000 else (None, None))
+    model = yt.MetalModel("small", str(tmp_path))
+    segments, info, mode = yt.transcribe(model, tmp_path / "audio.webm", None, True, 10)
+    assert seen.options.min_silence_duration_ms == yt.VAD_MIN_SILENCE_MS
+    length, kw, bar = state.calls[0]
+    assert length == 64000  # 4 s of speech out of 10 s
+    assert kw["language"] == "tr" and kw["word_timestamps"] is True and kw["condition_on_previous_text"] is False
+    assert bar is yt._ProgressLog and sys.modules["mlx_whisper.transcribe"].tqdm.tqdm is None  # hooked only during the call
+    assert [(s.start, s.end, s.text) for s in segments] == [(1.5, 2.5, "bir"), (6.5, 7.5, "iki")]
+    assert segments[1].words[0]["start"] == 6.5
+    assert (info.language, info.language_probability, info.duration) == ("tr", 0.97, 10.0) and mode == {"batched": False}
+
+
+def test_transcribe_metal_without_speech_returns_nothing_so_the_no_vad_retry_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state = _fake_mlx(monkeypatch)
+    _fake_audio_stack(monkeypatch, 10, [])
+    segments, info, _ = yt.transcribe(yt.MetalModel("small", str(tmp_path)), tmp_path / "a.webm", "en", True, 10)
+    assert segments == [] and state.calls == [] and info.language == "en"  # no mlx call at all on an empty VAD result
+
+
+def test_transcribe_metal_without_vad_decodes_the_whole_audio_and_keeps_a_given_language(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state = _fake_mlx(monkeypatch, transcribe=lambda samples, **kw: {"language": "en", "segments": [
+        {"start": 1.0, "end": 2.0, "text": "la la", "words": [{"word": "la", "start": 1.0, "end": 1.5, "probability": 0.5}]}]})
+    seen = _fake_audio_stack(monkeypatch, 6, [(1, 3)])
+    monkeypatch.setattr(yt, "detect_language_mlx", lambda *a: pytest.fail("the language is given"))
+    segments, info, _ = yt.transcribe(yt.MetalModel("small", str(tmp_path)), tmp_path / "a.webm", "en", False, 6)
+    assert seen.vad_calls == 0 and state.calls[0][0] == 6 * 16000
+    assert segments[0].words[0]["word"] == "la" and (info.language, info.language_probability) == ("en", None)
+
+
+def test_detect_language_mlx_returns_the_probability_and_survives_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    import types
+
+    audio = types.ModuleType("mlx_whisper.audio")
+    audio.N_SAMPLES, audio.N_FRAMES = 480000, 3000
+    audio.log_mel_spectrogram = lambda samples, n_mels, padding: argparse.Namespace(astype=lambda t: "mel")
+    audio.pad_or_trim = lambda mel, n, axis: argparse.Namespace(astype=lambda dtype: "mel")
+    _fake_mlx(monkeypatch)
+    monkeypatch.setitem(sys.modules, "mlx_whisper.audio", audio)
+    model = argparse.Namespace(dims=argparse.Namespace(n_mels=128), detect_language=lambda mel: (None, {"en": 0.1, "tr": 0.9}))
+    assert yt.detect_language_mlx(model, [0.0]) == ("tr", 0.9)
+    assert yt.detect_language_mlx(argparse.Namespace(), [0.0]) == (None, None)  # mlx-whisper then detects it itself
+
+
+def test_progress_log_reports_every_ten_percent(capsys: pytest.CaptureFixture[str]) -> None:
+    with yt._ProgressLog(total=6000, unit="frames") as bar:  # 60 s of audio in 10 ms mel frames
+        for _ in range(60):
+            bar.update(100)
+    lines = capsys.readouterr().err.splitlines()
+    assert lines[0] == "transcribe: 10% (00:06 / 01:00)" and lines[-1] == "transcribe: 100% (01:00 / 01:00)" and len(lines) == 10
+
+
+def test_metal_errors_become_gpu_unavailable_but_other_errors_pass_through(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def fail(message: object):
+        def run(*a: object, **k: object) -> None:
+            raise message if isinstance(message, BaseException) else RuntimeError(message)
+        return run
+
+    monkeypatch.setattr(yt, "transcribe", fail("Command buffer execution failed: Insufficient Memory"))
+    with pytest.raises(yt.GpuUnavailable, match="Insufficient Memory") as exc:
+        yt._transcribe_on_device(object(), tmp_path, None, True, 10, 1, "metal")
+    assert not exc.value.no_cuda and not exc.value.permanent
+    monkeypatch.setattr(yt, "transcribe", fail(MemoryError()))
+    with pytest.raises(yt.GpuUnavailable):
+        yt._transcribe_on_device(object(), tmp_path, None, True, 10, 1, "metal")
+    monkeypatch.setattr(yt, "transcribe", fail("tensor shape mismatch"))
+    with pytest.raises(RuntimeError, match="shape mismatch"):  # a bug, not a GPU problem
+        yt._transcribe_on_device(object(), tmp_path, None, True, 10, 1, "metal")
+
+
+def test_metal_run_is_labelled_and_estimated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    seen: dict = {}
+    model = yt.MetalModel("small", str(tmp_path))
+
+    def fake_transcribe(m: object, audio: Path, language: object, vad: bool, dur: object, batch: int = 8) -> tuple:
+        seen["batch"], seen["model"] = batch, m
+        info = yt.TranscribeInfo("tr", None, 10)  # no language probability from the engine
+        return _segs([(0, 5, "bir iki üç dört beş altı yedi")]), info, {"batched": False}
+
+    monkeypatch.setattr(yt, "load_whisper", lambda name, device="cuda", root=None: seen.update(device=device) or model)
+    monkeypatch.setattr(yt, "whisper_language", lambda code: code)
+    monkeypatch.setattr(yt, "transcribe", fake_transcribe)
+    released: list[object] = []
+    monkeypatch.setattr(yt, "release_whisper", released.append)
+    args = argparse.Namespace(model="small", device="metal", no_vad=False, lang=None, cookies_from_browser=None)
+    result = yt.run_whisper(_FakeWhisperYDL(tmp_path), {"duration": 10}, tmp_path, args, None)
+    assert seen["device"] == "metal" and seen["batch"] == 1 and released == [model]
+    assert result.settings["device"] == "metal" and result.settings["beam_size"] == 1 and result.settings["compute_type"] == "float16"
+    assert "language auto-detected as 'tr'" in result.notes[0] and "p=" not in result.notes[0]
+    assert any("Apple GPU (mlx-whisper, float16, greedy" in n for n in result.notes)
+    assert "on the Apple GPU" in capsys.readouterr().err
+    head = "\n".join(yt.header_lines(_meta(source="whisper", settings=result.settings | {"vad_min_silence_ms": 500})))
+    assert "whisper (small, float16, metal, VAD on (min silence 500 ms), beam 1, sequential)" in head
+
+
+def test_metal_estimate_uses_the_measured_speed() -> None:
+    base = yt.whisper_estimate_min(600, model="large-v3-turbo", device="metal")
+    assert base == pytest.approx(yt.ESTIMATE_OVERHEAD_MIN + 0.31)
+    assert yt.whisper_estimate_min(600, model="large-v3-turbo", device="metal", no_vad=True) == base  # same decoder either way
+    assert yt.whisper_estimate_min(600, model="large-v3", device="metal") > base > yt.whisper_estimate_min(600, model="small", device="metal")
+    assert base < yt.whisper_estimate_min(600, model="large-v3-turbo", device="cpu")
+
+
+@pytest.mark.parametrize("memory_mb,model", [(36864, "large-v3"), (16384, "large-v3"), (8192, "large-v3-turbo"), (4096, "small")])
+def test_recommend_on_apple_silicon_by_unified_memory(memory_mb: int, model: str) -> None:
+    assert yt.recommend(_gpu(None), False, apple_mb=memory_mb)[:3] == (model, "metal", False)
+    assert yt.recommend(_gpu(None), False)[:3] == ("small", "cpu", False)  # no Apple GPU: unchanged
+    assert yt.recommend(_gpu(16311), True, apple_mb=8192)[:3] == ("large-v3", "cuda", True)  # CUDA wins
+
+
+def test_metal_fit_warning() -> None:
+    assert yt.metal_fit_warning("large-v3", 24576) is None and yt.metal_fit_warning("large-v3", None) is None
+    assert "may run out of memory" in yt.metal_fit_warning("large-v3", 6144)
+    assert yt.metal_fit_warning("large-v3-turbo", 8192) is None
+
+
+def test_cuda_status_on_a_mac_points_to_the_apple_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert yt.cuda_status(_gpu(None), "darwin") == (False, "macOS has no CUDA (CPU mode only)")
+    _apple(monkeypatch)
+    assert yt.cuda_status(_gpu(None), "darwin") == (False, "macOS has no CUDA (Whisper runs on the Apple GPU instead)")
+
+
+def _doctor_apple(monkeypatch: pytest.MonkeyPatch, memory_mb: int = 24576, metal: tuple = (True, "ok (mlx-whisper 0.4.3, Metal)")) -> None:
+    _doctor_env(monkeypatch, _gpu(None), (False, "macOS has no CUDA (Whisper runs on the Apple GPU instead)"))
+    _apple(monkeypatch)
+    monkeypatch.setattr(yt, "apple_gpu_info", lambda: yt.GpuInfo("Apple M9 Max", memory_mb, None, None))
+    monkeypatch.setattr(yt, "metal_status", lambda *a, **k: metal)
+
+
+def test_doctor_on_apple_silicon_reports_the_engine_and_is_ready_after_setup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _doctor_apple(monkeypatch)
+    monkeypatch.setenv("VIDEO_WATCH_MODEL_DIR", str(tmp_path))
+    assert yt.main(["doctor"]) == yt.EXIT_OK
+    keys = _doctor_lines(capsys)
+    assert keys["GPU"] == ["Apple M9 Max (Apple GPU, unified memory)"] and keys["VRAM_TOTAL_MB"] == ["24576"]
+    assert keys["CUDA"][0].startswith("unavailable: macOS has no CUDA") and keys["METAL"] == ["ok (mlx-whisper 0.4.3, Metal)"]
+    assert keys["DEVICE"] == ["auto"] and keys["ENGINE"] == ["mlx-whisper (Apple GPU, float16)"]
+    assert keys["RECOMMEND_MODEL"] == ["large-v3"] and keys["RECOMMEND_DEVICE"] == ["metal"]
+    assert keys["MODEL_CACHED"] == ["no"] and keys["READY"] == ["no"]
+    assert any("not downloaded yet (about 3.1 GB" in w for w in keys["WARN"])
+    _mlx_snapshot(tmp_path, "large-v3", "weights.npz")
+    assert yt.main(["doctor"]) == yt.EXIT_OK
+    keys = _doctor_lines(capsys)
+    assert keys["MODEL_CACHED"] == ["yes"] and keys["READY"] == ["yes"]
+    assert yt.main(["doctor"]) == yt.EXIT_OK and "WARN" not in _doctor_lines(capsys)
+
+
+def test_doctor_cpu_mode_on_apple_silicon_needs_the_ct2_model_and_suggests_the_gpu(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _doctor_apple(monkeypatch)
+    monkeypatch.setenv("VIDEO_WATCH_MODEL_DIR", str(tmp_path))
+    _mlx_snapshot(tmp_path, "small")  # the MLX weights do not count for CPU mode
+    yt.save_config({"device": "cpu", "model": "small"})
+    assert yt.main(["doctor"]) == yt.EXIT_OK
+    keys = _doctor_lines(capsys)
+    assert keys["ENGINE"] == ["faster-whisper (CPU, int8)"] and keys["MODEL_CACHED"] == ["no"] and keys["READY"] == ["no"]
+    assert any("several times slower than on the Apple GPU (setup --device metal)" in w for w in keys["WARN"])
+
+
+def test_doctor_warns_when_the_apple_gpu_engine_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _doctor_apple(monkeypatch, metal=(False, "MLX sees no Metal GPU"))
+    monkeypatch.setenv("VIDEO_WATCH_MODEL_DIR", str(tmp_path))
+    _mlx_snapshot(tmp_path, "large-v3")
+    assert yt.main(["doctor"]) == yt.EXIT_OK
+    keys = _doctor_lines(capsys)
+    assert keys["METAL"] == ["unavailable: MLX sees no Metal GPU"] and keys["READY"] == ["no"]
+    assert keys["RECOMMEND_DEVICE"] == ["cpu"]
+    assert any("the Apple GPU engine is unavailable (MLX sees no Metal GPU)" in w for w in keys["WARN"])
+
+
+def test_doctor_on_other_machines_says_metal_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _doctor_env(monkeypatch, _gpu(16311), (True, "ok (driver 580.10)"))
+    assert yt.main(["doctor"]) == yt.EXIT_OK
+    keys = _doctor_lines(capsys)
+    assert keys["METAL"][0].startswith("unavailable: needs macOS on Apple Silicon")
+    assert keys["ENGINE"] == ["faster-whisper (CUDA, float16)"] and keys["RECOMMEND_DEVICE"] == ["cuda"]
+
+
+def test_setup_for_the_apple_gpu_downloads_the_mlx_weights(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _setup_env(monkeypatch, _gpu(None), False)
+    _apple(monkeypatch)
+    monkeypatch.setattr(yt, "metal_status", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(yt, "apple_gpu_info", lambda: yt.GpuInfo("Apple M9 Max", 24576, None, None))
+    monkeypatch.setattr(yt, "download_whisper_model", lambda *a: pytest.fail("the CTranslate2 model is for CUDA and CPU mode"))
+    monkeypatch.setattr(yt, "download_mlx_model", lambda name, root: calls.append(f"mlx {name}") or _mlx_snapshot(root, name))
+    argv = ["setup", "--device", "auto", "--model", "large-v3-turbo", "--sounds", "off", "--model-dir", str(tmp_path)]
+    assert yt.main([*argv, "--dry-run"]) == yt.EXIT_OK
+    out = capsys.readouterr().out.splitlines()
+    assert any(line.startswith("DOWNLOAD: whisper model large-v3-turbo (MLX weights for the Apple GPU)") and line.endswith("about 1.6 GB") for line in out)
+    assert "DOWNLOAD_TOTAL_GB: 1.6" in out and calls == []
+    assert yt.main(argv) == yt.EXIT_ERROR and "setup needs to download about 1.6 GB" in capsys.readouterr().out
+    assert yt.main([*argv, "--yes"]) == yt.EXIT_OK
+    out = capsys.readouterr().out.splitlines()
+    assert calls == ["mlx large-v3-turbo"] and "MODEL_CACHED: yes" in out and out[-1] == "SETUP: done"
+    assert yt.load_config()["device"] == "auto" and yt.model_cached("large-v3-turbo", tmp_path, "metal")
+    assert yt.main([*argv, "--yes"]) == yt.EXIT_OK  # cached now: nothing to download
+    assert calls == ["mlx large-v3-turbo"] and not any(l.startswith("DOWNLOAD: ") for l in capsys.readouterr().out.splitlines())
+
+
+def test_setup_stops_when_the_apple_gpu_engine_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _setup_env(monkeypatch, _gpu(None), False)
+    monkeypatch.setattr(yt, "metal_status", lambda *a, **k: (False, "needs macOS on Apple Silicon (an arm64 Mac)"))
+    assert yt.main(["setup", "--device", "metal", "--model", "small", "--model-dir", str(tmp_path), "--yes"]) == yt.EXIT_ERROR
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "ERROR: the Apple GPU engine is unavailable for device metal: needs macOS on Apple Silicon (an arm64 Mac)"
+    assert "setup --device cpu --model small" in out[1] and not _config_file().exists()
+
+
+def test_setup_cuda_on_apple_silicon_points_to_the_apple_gpu(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _setup_env(monkeypatch, _gpu(None), False)
+    _apple(monkeypatch)
+    assert yt.main(["setup", "--device", "cuda", "--model", "small", "--model-dir", str(tmp_path), "--yes"]) == yt.EXIT_ERROR
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].startswith("ERROR: CUDA is unavailable for device cuda") and "--device metal" in out[1]
+
+
+def test_heavy_env_on_apple_silicon_includes_mlx_whisper(monkeypatch: pytest.MonkeyPatch) -> None:
+    present = {"faster_whisper", "ctranslate2", "yt_dlp"}
+    monkeypatch.setattr(yt.importlib.util, "find_spec", lambda name: object() if name in present else None)
+    assert yt.heavy_env_present()
+    _apple(monkeypatch)
+    assert not yt.heavy_env_present()
+    present.add("mlx_whisper")
+    assert yt.heavy_env_present()
+
+
+def test_a_permanent_apple_gpu_failure_never_falls_back_to_auto_captions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _fake_youtube(monkeypatch, YT_INFO | {"subtitles": {}, "automatic_captions": {"en-orig": FMT}})
+
+    def no_metal(*a: object, **k: object) -> None:
+        raise yt.GpuUnavailable("the Apple GPU engine needs macOS on Apple Silicon (an arm64 Mac)", permanent=True)
+
+    monkeypatch.setattr(yt, "run_whisper", no_metal)
+    assert _run_main(monkeypatch, tmp_path, ["fetch", VID]) == yt.EXIT_NO_TRANSCRIPT
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "ERROR: Whisper could not run on the GPU (the Apple GPU engine needs macOS on Apple Silicon (an arm64 Mac))"
+    assert out[1] == f"HINT: {yt.METAL_HINT}" and "--device cpu" in out[1]
+
+
+def test_a_busy_apple_gpu_still_uses_the_youtube_auto_captions_like_cuda(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _fake_youtube(monkeypatch, YT_INFO | {"subtitles": {}, "automatic_captions": {"en-orig": FMT}})
+
+    def full(*a: object, **k: object) -> None:
+        raise yt.GpuUnavailable("[metal::malloc] out of memory")
+
+    monkeypatch.setattr(yt, "run_whisper", full)
+    assert _run_main(monkeypatch, tmp_path, ["fetch", VID]) == yt.EXIT_OK
+    assert capsys.readouterr().out.splitlines()[0] == "SOURCE: auto-subtitles-fallback"
