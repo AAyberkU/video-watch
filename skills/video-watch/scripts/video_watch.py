@@ -52,6 +52,7 @@ from __future__ import annotations
 import argparse
 import base64
 import bisect
+import contextlib
 import ctypes
 import gc
 import glob
@@ -163,7 +164,8 @@ CPU_BATCH_SIZE = 4
 CPU_RTF = {"large-v3": 0.36, "large-v2": 0.36, "large-v3-turbo": 0.19, "medium": 0.25, "small": 0.075, "base": 0.035, "tiny": 0.02}
 CPU_SEQUENTIAL_SLOWDOWN = 1.2
 # Apple GPU engine (mlx-whisper, float16, greedy decoding): minutes per minute of audio, end to end
-# (audio decoding, VAD, transcription) on an Apple M5 Pro with 24 GB, for the 18:40 English lecture
+# (audio decoding, VAD, transcription) on an Apple M5 Pro with 24 GB (measured by the contributor of
+# the engine, not by the maintainer), for the 18:40 English lecture
 # (small 0.026, turbo 0.031, large-v3 0.095; 3-minute clips run at 0.019, 0.026 and 0.065, and the
 # no-VAD pass is as fast). large-v2 has large-v3's architecture; medium, base and tiny are estimates.
 # Peak resident memory in MB of the 3-minute runs (unified memory, shared with the system);
@@ -449,6 +451,11 @@ METAL_HINT = (
     "the Apple GPU engine (mlx-whisper) could not start. Rerun the command (uv reinstalls the packages of "
     f"video_watch.py), or use CPU mode: --device cpu --model small, or {RUN_CMD} setup --device cpu --model small --yes"
 )
+METAL_NOT_MAC_HINT = (
+    "device metal (the Apple GPU engine, mlx-whisper) needs an Apple Silicon Mac. Rerun with --device auto "
+    f"(the NVIDIA GPU here) or --device cpu --model small, or change the default with: {RUN_CMD} setup --device auto"
+)
+MODEL_DOWNLOAD_HINT = "check the network and disk space, then rerun the command (or download the model first with setup)"
 NO_CUDA_HINT = (
     "no usable NVIDIA GPU (CUDA) was found. CPU mode works everywhere but is slow: rerun with "
     f"--device cpu --model small, or make it the default with: {RUN_CMD} setup --device cpu --model small --yes "
@@ -522,13 +529,16 @@ class GpuUnavailable(Exception):
     help; `permanent` marks the same for the Apple GPU engine (never the YouTube auto-captions
     fallback, which is for a busy or full GPU)."""
 
-    def __init__(self, message: str, no_cuda: bool = False, permanent: bool = False):
+    def __init__(self, message: str, no_cuda: bool = False, permanent: bool = False, hint: str | None = None):
         super().__init__(message)
         self.no_cuda = no_cuda
         self.permanent = permanent
+        self._hint = hint
 
     @property
     def hint(self) -> str:
+        if self._hint:
+            return self._hint
         if self.permanent:
             return METAL_HINT
         return NO_CUDA_HINT if self.no_cuda else GPU_RETRY_HINT
@@ -1981,27 +1991,43 @@ def download_mlx_model(name: str, root: Path) -> Path:
     ))
 
 
-def load_metal(model_name: str, root: Path) -> MetalModel:
-    """The model on the Apple GPU (float16, through mlx-whisper). Problems raise GpuUnavailable
-    (permanent: retrying later cannot help); there is no CPU fallback."""
+def require_metal() -> None:
+    """Raise the permanent GpuUnavailable when the Apple GPU engine cannot run on this machine
+    (with a hint about `--device auto` on a machine that is not an Apple Silicon Mac)."""
     ok, why = metal_status(deep=False)
     if not ok:
-        raise GpuUnavailable(f"the Apple GPU engine {why}", permanent=True)
+        hint = None if apple_silicon() else METAL_NOT_MAC_HINT
+        raise GpuUnavailable(f"the Apple GPU engine {why}", permanent=True, hint=hint)
+
+
+def load_metal(model_name: str, root: Path) -> MetalModel:
+    """The model on the Apple GPU (float16, through mlx-whisper). An engine that cannot start
+    raises a permanent GpuUnavailable, a Metal or memory error a retryable one; there is no CPU
+    fallback. A failed weight download is a FetchError (never a GPU error), other errors pass
+    through, as on CUDA."""
+    require_metal()
     try:
         import mlx.core as mx
         from mlx_whisper.transcribe import ModelHolder
-
-        if not mx.metal.is_available():
-            raise GpuUnavailable("MLX sees no Metal GPU", permanent=True)
-        path = mlx_snapshot(model_name, root) or download_mlx_model(model_name, root)
-        ModelHolder.get_model(str(path), mx.float16)  # load the weights now: errors surface before any audio work
-    except GpuUnavailable:
-        raise
     except ImportError as exc:
         raise GpuUnavailable(f"mlx-whisper is not installed in this environment ({exc})", permanent=True) from None
+    if not mx.metal.is_available():
+        raise GpuUnavailable("MLX sees no Metal GPU", permanent=True)
+    path = mlx_snapshot(model_name, root)
+    if path is None:
+        try:
+            path = download_mlx_model(model_name, root)
+        except Exception as exc:  # noqa: BLE001 - network, disk or hub errors
+            raise FetchError(
+                f"the Whisper model download failed ({type(exc).__name__}: {exc})", EXIT_ERROR, MODEL_DOWNLOAD_HINT
+            ) from None
+    try:
+        ModelHolder.get_model(str(path), mx.float16)  # load the weights now: errors surface before any audio work
     except (RuntimeError, OSError, MemoryError) as exc:
-        message = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
-        raise GpuUnavailable(message) from None
+        if is_metal_error(exc):
+            message = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+            raise GpuUnavailable(message) from None
+        raise
     return MetalModel(model_name, str(path))
 
 
@@ -2036,13 +2062,14 @@ class SpeechTimeline:
 
     def original(self, t: float, is_end: bool = False) -> float:
         """Original time of speech-only time `t`; a boundary belongs to the earlier chunk for an
-        end time and to the later chunk for a start time."""
+        end time and to the later chunk for a start time. Times past the speech (Whisper can
+        place the last timestamps after it) end at the last chunk's end."""
         if not self.chunks:
             return t
         pos = bisect.bisect_left(self.starts, t) - 1 if is_end else bisect.bisect_right(self.starts, t) - 1
         i = min(max(pos, 0), len(self.chunks) - 1)
         start, end = self.chunks[i]
-        return min(end, start + max(0.0, t - self.starts[i])) if is_end else start + max(0.0, t - self.starts[i])
+        return min(end, start + max(0.0, t - self.starts[i]))
 
 
 def segments_from_mlx(raw: Sequence[dict[str, Any]], timeline: SpeechTimeline | None = None) -> list[Segment]:
@@ -2130,20 +2157,27 @@ def transcribe_metal(
     probability = None
     if not language:
         language, probability = detect_language_mlx(ModelHolder.get_model(model.path, mx.float16), samples)
-    module = sys.modules["mlx_whisper.transcribe"]  # the module, not the function that `mlx_whisper` re-exports
-    real_tqdm = module.tqdm
-    module.tqdm = argparse.Namespace(tqdm=_ProgressLog)  # progress is in mel frames: 100 per second
+    # mlx-whisper 0.4 draws its progress bar with `tqdm.tqdm(...)` in this module (the module, not the
+    # function that `mlx_whisper` re-exports); swap in the stderr log only when that is still so,
+    # otherwise run without a bar (verbose=None) instead of failing on a changed internal.
+    module = sys.modules.get("mlx_whisper.transcribe")
+    real_tqdm = getattr(module, "tqdm", None)
+    hooked = callable(getattr(real_tqdm, "tqdm", None))
+    if hooked:
+        module.tqdm = argparse.Namespace(tqdm=_ProgressLog)  # progress is in mel frames: 100 per second
     try:
-        result = mlx_whisper.transcribe(
-            samples,
-            path_or_hf_repo=model.path,
-            language=language,
-            word_timestamps=True,
-            condition_on_previous_text=False,
-            verbose=False,
-        )
+        with contextlib.redirect_stdout(sys.stderr):  # stdout is the KEY: value contract; mlx-whisper may print
+            result = mlx_whisper.transcribe(
+                samples,
+                path_or_hf_repo=model.path,
+                language=language,
+                word_timestamps=True,
+                condition_on_previous_text=False,
+                verbose=False if hooked else None,
+            )
     finally:
-        module.tqdm = real_tqdm
+        if hooked:
+            module.tqdm = real_tqdm
     return segments_from_mlx(result["segments"], timeline), TranscribeInfo(
         language or result.get("language"), probability, total_s
     ), settings
@@ -2336,6 +2370,8 @@ def run_whisper(
     device = resolve_device(args)
     root = model_dir(args)
     duration = info.get("duration") or 0
+    if device == "metal":
+        require_metal()  # before the ESTIMATE: no estimate for an engine that cannot run on this machine
     batch = CPU_BATCH_SIZE if device == "cpu" else 1 if device == "metal" else choose_batch_size(model_name, gpu_free_mb())
     estimate = whisper_estimate_min(duration, args.no_vad, model_name, device, batch)
     first_use = not model_cached(model_name, root, device)

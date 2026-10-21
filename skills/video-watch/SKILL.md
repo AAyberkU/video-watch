@@ -222,7 +222,7 @@ list was truncated at `--limit`.
 | 1, `ERROR: ffmpeg …` | ffmpeg failed on this video | Rerun once, then report it. Do not upgrade yt-dlp. |
 | 1, `ERROR: another run is using this video` | A run for this video is still active | Wait for it to finish, then retry. |
 | 3, `ERROR: no usable CUDA GPU for Whisper (…)` | No usable NVIDIA GPU, driver or CUDA libraries. There is no fallback, not even auto-captions; the tool never switches to the CPU by itself | Explain the `HINT:`. Offer CPU mode only as the user's choice: `--device cpu --model small` for one run, or `setup --device cpu --model small` to keep it (slow). Suggest running `doctor`. |
-| 3, `ERROR: Whisper could not run on the GPU (…)` | The GPU is busy or out of memory (YouTube falls back to auto-captions instead; other sources stop), or, on a Mac, the Apple GPU engine could not start (then also on YouTube, and the `HINT:` says so) | Retry when the GPU is free (close games or other GPU apps), or offer a smaller model (`--model large-v3-turbo` or `small`). If the Apple GPU engine could not start, rerun once, then follow the `HINT:` (CPU mode only as the user's choice). |
+| 3, `ERROR: Whisper could not run on the GPU (…)` | The GPU is busy or out of memory (YouTube falls back to auto-captions instead; other sources stop), or, on a Mac, the Apple GPU engine could not start (then also on YouTube, and the `HINT:` says so), or device `metal` was chosen on a machine that is not an Apple Silicon Mac | Retry when the GPU is free (close games or other GPU apps), or offer a smaller model (`--model large-v3-turbo` or `small`). If the Apple GPU engine could not start, rerun once, then follow the `HINT:` (CPU mode only as the user's choice). |
 | 3, `ERROR: sound map unavailable: …` (`sounds` only) | The sound map is not set up (also after an update, until `setup --sounds on --yes` runs once), there is no visible NVIDIA GPU, or the GPU is busy | Say so; answer from the transcript. Follow the `HINT:`: retry later for a busy GPU; offer `setup --sounds on` (ask first, state the printed size) when it is not set up. |
 | 1, `ERROR:` about the config, a setting or the work dir | An invalid config file, `VIDEO_WATCH_*` value or `work_dir` | Explain the `HINT:`; change settings only with the user's consent. |
 | 1, any other `ERROR:` whose `HINT:` names yt-dlp | Extraction failure: yt-dlp is outdated, the site changed, or the stream was refused | Retry once with `uv run --upgrade-package yt-dlp "<skill-dir>/scripts/video_watch.py" fetch "<url>"`. Upgrade only when the `HINT:` names yt-dlp. |
@@ -234,7 +234,8 @@ Whisper model; running `fetch` again later retries Whisper automatically.
 ## Setup and settings
 
 When something about the setup is unclear, run `doctor` in the light form (see
-[Running the tool](#running-the-tool)): a read-only report (GPU, CUDA, ffmpeg, model, sound map)
+[Running the tool](#running-the-tool)): a read-only report (GPU, CUDA, `METAL:` for the Apple GPU,
+ffmpeg, model, sound map)
 that always exits 0 and ends with `READY: yes` when transcription can run. `config show` prints the
 current settings. Change settings only when the user asks:
 

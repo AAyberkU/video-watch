@@ -177,7 +177,8 @@ ESTIMATE: ~5.0 min for 1:03:30 of audio (whisper small, on the CPU, slow)
   `medium`, 0.031 `large-v3-turbo`, 0.026 `small`, 0.02 `base`, 0.018 `tiny`; the same with
   `--no-vad` (no batches).
 - The first use of a model adds up to 1.5 min for its download (`incl. first-time model download`).
-- Calibrated on an RTX 5060 Ti, a 12-thread desktop CPU (6 threads) and an Apple M5 Pro (24 GB);
+- Calibrated on an RTX 5060 Ti, a 12-thread desktop CPU (6 threads) and an Apple M5 Pro (24 GB;
+  measured by the contributor of the Apple GPU engine, [@Bilaxten](https://github.com/Bilaxten));
   `medium`, `base` and `tiny` are estimates. Slower hardware takes proportionally longer.
 
 When a Whisper run used the CPU, stdout has
@@ -238,7 +239,7 @@ built (`ERROR: sound map unavailable: …`). For `fetch`, a sound map that canno
 | Exit-3 `ERROR:` | Cause | `HINT:` |
 | --- | --- | --- |
 | `no usable CUDA GPU for Whisper (<reason>)` | No NVIDIA GPU, driver or CUDA libraries (device `auto` or `cuda`). | `no usable NVIDIA GPU (CUDA) was found. CPU mode works everywhere but is slow: rerun with --device cpu --model small, or make it the default with: setup --device cpu --model small --yes (downloads the small model, about 0.5 GB)` |
-| `Whisper could not run on the GPU (<reason>)` | The GPU is busy or out of memory (not YouTube; YouTube uses its auto-captions), or the Apple GPU engine cannot start at all (`device` `metal` or `auto` on a Mac: mlx-whisper missing or no Metal; never the auto-captions, also on YouTube). | Retry later (close games or other GPU apps) or choose a smaller model; the auto-captions fallback exists only for YouTube. For an Apple GPU engine that cannot start: `the Apple GPU engine (mlx-whisper) could not start. Rerun the command (uv reinstalls the packages of video_watch.py), or use CPU mode: --device cpu --model small, or … setup --device cpu --model small --yes`. |
+| `Whisper could not run on the GPU (<reason>)` | The GPU is busy or out of memory (not YouTube; YouTube uses its auto-captions), or the Apple GPU engine cannot start at all (`device` `metal` or `auto` on a Mac: mlx-whisper missing or no Metal; never the auto-captions, also on YouTube), or `device` `metal` on a machine that is not an Apple Silicon Mac. | Retry later (close games or other GPU apps) or choose a smaller model; the auto-captions fallback exists only for YouTube. For an Apple GPU engine that cannot start: `the Apple GPU engine (mlx-whisper) could not start. Rerun the command (uv reinstalls the packages of video_watch.py), or use CPU mode: --device cpu --model small, or … setup --device cpu --model small --yes`. For `metal` on another machine: `device metal (the Apple GPU engine, mlx-whisper) needs an Apple Silicon Mac. Rerun with --device auto (the NVIDIA GPU here) or --device cpu --model small, or change the default with: … setup --device auto`. |
 | `Whisper could not run on the GPU (<reason>) and no original-language auto-captions exist` | YouTube, GPU busy, and no `-orig` track. | As above. |
 
 Exit-1 causes are told apart by their `ERROR:` prefix, so a yt-dlp upgrade is suggested only for
@@ -698,12 +699,21 @@ change setup:
   GPU decodes the speech chunks joined end to end (times are mapped back). The model weights are
   MLX conversions (`mlx-community/whisper-*`) stored under `model_dir` next to the CTranslate2 ones,
   so switching between `metal` and `cpu` downloads each once. Memory is the Mac's unified memory
-  (peak resident memory 1.2 GB for `small`, 2.1 GB for `large-v3-turbo`, 3.9 GB for `large-v3`).
-  Failures raise the same `GpuUnavailable` handling as CUDA: an out-of-memory or busy GPU falls
-  back on YouTube to its auto-captions or exits 3 (`ERROR: Whisper could not run on the GPU
-  (<reason>)`); an engine that cannot start at all (mlx-whisper missing, no Metal, `device: metal`
-  on a machine that is not Apple Silicon) exits 3 with that error and the Apple GPU `HINT:`, also
-  on YouTube, and never switches to the CPU. The sound map still needs an NVIDIA GPU.
+  (peak resident memory 1.2 GB for `small`, 2.1 GB for `large-v3-turbo`, 3.9 GB for `large-v3`,
+  as measured by the contributor on an M5 Pro). Failures raise the same `GpuUnavailable` handling
+  as CUDA: an out-of-memory or busy GPU falls back on YouTube to its auto-captions or exits 3
+  (`ERROR: Whisper could not run on the GPU (<reason>)`); an engine that cannot start at all
+  (mlx-whisper missing, no Metal) exits 3 with that error and the Apple GPU `HINT:`, also on
+  YouTube, and never switches to the CPU. `device: metal` on a machine that is not an Apple
+  Silicon Mac stops the same way before any estimate, with `HINT: device metal (the Apple GPU
+  engine, mlx-whisper) needs an Apple Silicon Mac. Rerun with --device auto …`. A failed first-time
+  download of the MLX weights is not a GPU error: exit 1 with `ERROR: the Whisper model download
+  failed (…)` and `HINT: check the network and disk space, then rerun the command (or download the
+  model first with setup)`, never the auto-captions. Other model-loading errors (for example a
+  damaged weight file) are reported as they are, as on CUDA. Known limitation (unverified): when
+  MLX runs out of unified memory (most likely `large-v3` on an 8 GB Mac), the process may be
+  aborted by MLX itself rather than exit with `ERROR:`; use `large-v3-turbo` or `small` there.
+  The sound map still needs an NVIDIA GPU.
 - **No usable CUDA:** `fetch` exits 3 with
   `ERROR: no usable CUDA GPU for Whisper (<reason>)` and the CPU-mode `HINT:` shown under
   [Exit codes and errors](#exit-codes-and-errors). There is no fallback, also not to YouTube's

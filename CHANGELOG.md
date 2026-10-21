@@ -9,20 +9,27 @@ names may still change between minor versions; every such change is listed here.
 
 ### Apple Silicon
 
-- Whisper now runs on the GPU of Apple Silicon Macs through mlx-whisper (MLX). `device: auto` picks
+- Whisper now runs on the GPU of Apple Silicon Macs through mlx-whisper (MLX), contributed by
+  [@Bilaxten](https://github.com/Bilaxten) in #5. `device: auto` picks
   it on an arm64 Mac; `metal` selects it explicitly, `cpu` still means faster-whisper on the CPU.
   Word timestamps, the VAD (faster-whisper's Silero VAD, with the speech chunks joined and the times
   mapped back), the automatic no-VAD retry, language detection with its probability, `SPEECH:` and
   frame pairing work as on CUDA. Differences: greedy decoding with temperature fallback instead of
   beam search 5 (transcript header `beam 1`), no batching, MLX weights (`mlx-community/whisper-*`,
   the same sizes) stored in `model_dir` next to the CTranslate2 ones.
-- Measured on an Apple M5 Pro (24 GB), 18:40 lecture end to end: `small` RTF 0.026, `large-v3-turbo`
+- Measured by the contributor on an Apple M5 Pro (24 GB, macOS 27; not reproduced by the
+  maintainer), 18:40 lecture end to end: `small` RTF 0.026, `large-v3-turbo`
   0.031, `large-v3` 0.095, against 0.063 for `small` on the CPU (int8); peak memory 1.2, 2.1 and
   3.9 GB. Comparison with whisper.cpp and the CPU in [`docs/DESIGN.md`](docs/DESIGN.md#apple-silicon-engine).
 - Failures of the Apple GPU engine raise the same GPU errors as CUDA and never switch to the CPU:
   a busy or full GPU falls back to YouTube's auto-captions or exits 3; an engine that cannot start
   (mlx-whisper missing, no Metal) exits 3 with `ERROR: Whisper could not run on the GPU (…)` and a
-  `HINT:` about CPU mode, also on YouTube.
+  `HINT:` about CPU mode, also on YouTube. `--device metal` on a machine that is not an Apple
+  Silicon Mac stops the same way before any estimate, with a `HINT:` to use `--device auto`. A
+  failed first-time download of the MLX weights exits 1 with `ERROR: the Whisper model download
+  failed (…)` and a network/disk `HINT:` (never a GPU error or the auto-captions); other
+  model-loading errors pass through as on CUDA. Known limitation (unverified): MLX may abort the
+  process when it runs out of unified memory (most likely `large-v3` on an 8 GB Mac).
 - `doctor` has new `METAL:` and `ENGINE:` lines, reports the chip and its unified memory under
   `GPU:` and `VRAM_TOTAL_MB:`, recommends `RECOMMEND_DEVICE: metal` with a model by memory (16 GB or
   more `large-v3`, 8 GB `large-v3-turbo`, otherwise `small`), and checks `MODEL_CACHED:` for the
@@ -31,7 +38,12 @@ names may still change between minor versions; every such change is listed here.
 - The script's dependencies gain `mlx-whisper>=0.4.3,<0.5` on Apple Silicon only (about 0.7 GB in
   uv's cache); Windows and Linux installs do not change. mlx-whisper's PyTorch dependency is
   overridden away in the script header (only its conversion tool imports it).
-- macOS CPU mode was run on an Apple M5 Pro (`doctor`, `setup`, `fetch`, frames) and works.
+- macOS CPU mode was run by the contributor on an Apple M5 Pro (`doctor`, `setup`, `fetch`,
+  frames) and works; it is expected to work on Intel Macs but unverified there.
+- Review follow-ups: segment and word start times past the joined speech are clamped like end
+  times; mlx-whisper's progress bar is replaced only while its internals still match (otherwise
+  the run continues without a bar), and anything it prints goes to stderr, never into the stdout
+  keys.
 
 ### Changed
 

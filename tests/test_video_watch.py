@@ -3696,7 +3696,7 @@ def _fake_mlx(monkeypatch: pytest.MonkeyPatch, metal: bool = True, transcribe: o
     """Fake `mlx.core`, `mlx_whisper` and `mlx_whisper.transcribe` (with a tqdm hook) in sys.modules."""
     import types
 
-    state = argparse.Namespace(holder=_FakeHolder, cleared=[], calls=[])
+    state = argparse.Namespace(holder=_FakeHolder, cleared=[], calls=[], real_bar=lambda *a, **k: None)
     _FakeHolder.loaded, _FakeHolder.model, _FakeHolder.model_path = [], None, None
     core = types.ModuleType("mlx.core")
     core.float16 = "float16"
@@ -3706,11 +3706,11 @@ def _fake_mlx(monkeypatch: pytest.MonkeyPatch, metal: bool = True, transcribe: o
     mlx.core = core
     module = types.ModuleType("mlx_whisper.transcribe")
     module.ModelHolder = _FakeHolder
-    module.tqdm = argparse.Namespace(tqdm=None)
+    module.tqdm = argparse.Namespace(tqdm=state.real_bar)  # mlx-whisper 0.4 calls `tqdm.tqdm(...)`
     package = types.ModuleType("mlx_whisper")
 
     def run(samples: object, **kw: object) -> dict:
-        state.calls.append((len(samples), kw, module.tqdm.tqdm))
+        state.calls.append((len(samples), kw, getattr(getattr(module, "tqdm", None), "tqdm", None)))
         return transcribe(samples, **kw) if transcribe else {"segments": [], "text": "", "language": kw["language"]}
 
     package.transcribe = run
@@ -3802,12 +3802,12 @@ def test_load_metal_downloads_a_missing_model_into_the_model_dir(monkeypatch: py
 def test_load_metal_failures_are_gpu_unavailable_never_a_cpu_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     with pytest.raises(yt.GpuUnavailable, match="macOS on Apple Silicon") as exc:  # not a Mac with an Apple chip
         yt.load_whisper("small", "metal", tmp_path)
-    assert exc.value.permanent and exc.value.hint == yt.METAL_HINT and "--device cpu" in yt.METAL_HINT
+    assert exc.value.permanent and exc.value.hint == yt.METAL_NOT_MAC_HINT and "--device auto" in yt.METAL_NOT_MAC_HINT
     _apple(monkeypatch)
     monkeypatch.setitem(sys.modules, "mlx.core", None)
     with pytest.raises(yt.GpuUnavailable, match="mlx-whisper is not installed") as exc:
         yt.load_whisper("small", "metal", tmp_path)
-    assert exc.value.permanent
+    assert exc.value.permanent and exc.value.hint == yt.METAL_HINT and "--device cpu" in yt.METAL_HINT
     _fake_mlx(monkeypatch, metal=False)
     with pytest.raises(yt.GpuUnavailable, match="no Metal GPU") as exc:
         yt.load_whisper("small", "metal", tmp_path)
@@ -3822,6 +3822,56 @@ def test_load_metal_failures_are_gpu_unavailable_never_a_cpu_fallback(monkeypatc
     with pytest.raises(yt.GpuUnavailable, match="too much memory") as exc:  # a busy or full GPU: not permanent
         yt.load_whisper("small", "metal", tmp_path)
     assert not exc.value.permanent and exc.value.hint == yt.GPU_RETRY_HINT
+
+    def corrupt(path: str, dtype: object) -> None:
+        raise RuntimeError("[load_safetensors] Invalid json header length")
+
+    monkeypatch.setattr(state.holder, "get_model", corrupt)
+    with pytest.raises(RuntimeError, match="json header"):  # not a GPU problem: passes through, as on CUDA
+        yt.load_whisper("small", "metal", tmp_path)
+
+
+def test_load_metal_download_failure_is_a_fetch_error_not_a_gpu_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _apple(monkeypatch)
+    _fake_mlx(monkeypatch)
+
+    def offline(name: str, root: Path) -> Path:
+        raise OSError("Cannot reach https://huggingface.co")
+
+    monkeypatch.setattr(yt, "download_mlx_model", offline)
+    with pytest.raises(yt.FetchError, match="the Whisper model download failed") as exc:
+        yt.load_whisper("small", "metal", tmp_path)
+    assert exc.value.code == yt.EXIT_ERROR and exc.value.hint == yt.MODEL_DOWNLOAD_HINT
+
+
+def test_a_failed_mlx_download_never_falls_back_to_auto_captions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    downloads = _fake_youtube(monkeypatch, YT_INFO | {"subtitles": {}, "automatic_captions": {"en-orig": FMT}})
+    _apple(monkeypatch)
+    _fake_mlx(monkeypatch)
+    monkeypatch.setenv("VIDEO_WATCH_MODEL_DIR", str(tmp_path / "models"))
+
+    def offline(name: str, root: Path) -> Path:
+        raise OSError("Cannot reach https://huggingface.co")
+
+    monkeypatch.setattr(yt, "download_mlx_model", offline)
+    assert _run_main(monkeypatch, tmp_path / "work", ["fetch", VID]) == yt.EXIT_ERROR
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].startswith("ERROR: the Whisper model download failed (OSError: Cannot reach")
+    assert out[1] == f"HINT: {yt.MODEL_DOWNLOAD_HINT}" and not any(l.startswith("SOURCE:") for l in out)
+    assert downloads == []  # stopped before the audio download
+
+
+def test_a_metal_run_on_another_machine_stops_before_the_estimate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(yt, "load_whisper", lambda *a, **k: pytest.fail("never loads a model"))
+    args = argparse.Namespace(model="small", device="metal", no_vad=False, lang=None, cookies_from_browser=None)
+    with pytest.raises(yt.GpuUnavailable) as exc:
+        yt.run_whisper(_FakeWhisperYDL(tmp_path), {"duration": 10}, tmp_path, args, None)
+    assert exc.value.permanent and exc.value.hint == yt.METAL_NOT_MAC_HINT
+    assert "ESTIMATE" not in capsys.readouterr().err
 
 
 def test_release_whisper_frees_the_metal_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -3842,6 +3892,8 @@ def test_speech_timeline_maps_joined_speech_back_to_the_original_audio() -> None
     assert timeline.original(2.0, is_end=True) == 3.0  # an end on the boundary to the earlier one
     assert timeline.original(3.5) == 7.5 and timeline.original(5.0, is_end=True) == 21.0
     assert timeline.original(9.0, is_end=True) == 21.0 and yt.SpeechTimeline([]).original(1.5) == 1.5
+    assert timeline.original(9.0) == 21.0  # a start past the speech is clamped like an end, never after it
+    assert timeline.original(1.99) == pytest.approx(2.99) and timeline.original(-0.5) == 1.0
 
 
 def test_segments_from_mlx_keep_word_timestamps_and_restore_times() -> None:
@@ -3900,7 +3952,8 @@ def test_transcribe_metal_with_vad_decodes_only_the_speech_and_maps_the_times_ba
     length, kw, bar = state.calls[0]
     assert length == 64000  # 4 s of speech out of 10 s
     assert kw["language"] == "tr" and kw["word_timestamps"] is True and kw["condition_on_previous_text"] is False
-    assert bar is yt._ProgressLog and sys.modules["mlx_whisper.transcribe"].tqdm.tqdm is None  # hooked only during the call
+    assert kw["verbose"] is False  # the bar, which the hook turns into stderr lines
+    assert bar is yt._ProgressLog and sys.modules["mlx_whisper.transcribe"].tqdm.tqdm is state.real_bar  # hooked only during the call
     assert [(s.start, s.end, s.text) for s in segments] == [(1.5, 2.5, "bir"), (6.5, 7.5, "iki")]
     assert segments[1].words[0]["start"] == 6.5
     assert (info.language, info.language_probability, info.duration) == ("tr", 0.97, 10.0) and mode == {"batched": False}
@@ -3925,6 +3978,24 @@ def test_transcribe_metal_without_vad_decodes_the_whole_audio_and_keeps_a_given_
     segments, info, _ = yt.transcribe(yt.MetalModel("small", str(tmp_path)), tmp_path / "a.webm", "en", False, 6)
     assert seen.vad_calls == 0 and state.calls[0][0] == 6 * 16000
     assert segments[0].words[0]["word"] == "la" and (info.language, info.language_probability) == ("en", None)
+
+
+def test_transcribe_metal_without_the_tqdm_hook_runs_without_a_bar_and_keeps_stdout_clean(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def chatty(samples: object, **kw: object) -> dict:
+        print("Detected language: English")  # mlx-whisper prints this when it detects the language itself
+        return {"language": "en", "segments": []}
+
+    state = _fake_mlx(monkeypatch, transcribe=chatty)
+    monkeypatch.delattr(sys.modules["mlx_whisper.transcribe"], "tqdm")  # a later mlx-whisper without `tqdm.tqdm`
+    _fake_audio_stack(monkeypatch, 4, [])
+    monkeypatch.setattr(yt, "detect_language_mlx", lambda *a: (None, None))
+    segments, info, _ = yt.transcribe(yt.MetalModel("small", str(tmp_path)), tmp_path / "a.webm", None, False, 4)
+    assert segments == [] and info.language == "en"
+    assert state.calls[0][1]["verbose"] is None and state.calls[0][2] is None  # no bar instead of a crash
+    captured = capsys.readouterr()
+    assert captured.out == "" and "Detected language: English" in captured.err
 
 
 def test_detect_language_mlx_returns_the_probability_and_survives_failures(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3976,6 +4047,8 @@ def test_metal_run_is_labelled_and_estimated(monkeypatch: pytest.MonkeyPatch, tm
         info = yt.TranscribeInfo("tr", None, 10)  # no language probability from the engine
         return _segs([(0, 5, "bir iki üç dört beş altı yedi")]), info, {"batched": False}
 
+    _apple(monkeypatch)
+    monkeypatch.setattr(yt, "metal_status", lambda *a, **k: (True, "ok"))
     monkeypatch.setattr(yt, "load_whisper", lambda name, device="cuda", root=None: seen.update(device=device) or model)
     monkeypatch.setattr(yt, "whisper_language", lambda code: code)
     monkeypatch.setattr(yt, "transcribe", fake_transcribe)

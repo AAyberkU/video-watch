@@ -362,9 +362,9 @@ means. The sound map turns them into a timeline the agent reads as text. Researc
   on Windows and Linux, so CPU-only machines download them too (macOS does not). Splitting them out
   is on the [roadmap](../ROADMAP.md).
 - **macOS:** no CUDA. On Apple Silicon `auto` runs Whisper on the Apple GPU (next section); CPU mode
-  (the CUDA wheels are skipped there) works on every Mac when chosen. Verified on an Apple M5 Pro
-  (24 GB, macOS 27): `small` int8 on the CPU transcribed the 18:40 English lecture in 71 s (RTF
-  0.063).
+  (the CUDA wheels are skipped there) is expected to work on every Mac when chosen. Verified by
+  the contributor of the Apple GPU engine on an Apple M5 Pro (24 GB, macOS 27): `small` int8 on the
+  CPU transcribed the 18:40 English lecture in 71 s (RTF 0.063). Unverified on Intel Macs.
 - **Not yet supported:** AMD/Intel GPUs, which need another engine (for example whisper.cpp with
   Vulkan), and the sound map on anything but an NVIDIA GPU (its PyTorch path is CUDA-only in this
   release). See the [help-wanted drafts](help-wanted/).
@@ -394,7 +394,9 @@ means. The sound map turns them into a timeline the agent reads as text. Researc
 - **Decoding differences:** greedy decoding with temperature fallback instead of beam search 5
   (mlx-whisper has no beam search; the header says `beam 1`), no batching, and the
   language probability comes from `detect_language` on the first 30 s of speech.
-- **Measured** on an Apple M5 Pro (15 cores, 24 GB, macOS 27) with three 3-minute public clips,
+- **Measured by the contributor, [@Bilaxten](https://github.com/Bilaxten)** (PR #5), on an Apple
+  M5 Pro (15 cores, 24 GB, macOS 27); the maintainer has no Mac and has not reproduced these
+  numbers. Three 3-minute public clips,
   `fetch`'s Whisper settings (word timestamps on, no conditioning on the previous text, language
   auto-detected): an English lecture with manual subtitles (3Blue1Brown, 0:30-3:30), a Turkish talk
   with manual Turkish subtitles (TEDxIstanbul, 1:00-4:00) and a pop song (0:00-3:00, English
@@ -411,7 +413,7 @@ means. The sound map turns them into a timeline the agent reads as text. Researc
   | faster-whisper CPU int8, beam 5, `small` | 0.069 / 0.103 / 0.146 | 0.028 / 0.169 / 0.167 | 2.4 GB |
   | **mlx-whisper Apple GPU, `small`** | **0.019 / 0.019 / 0.013** | **0.055 / 0.087 / 0.189** | 1.2 GB |
   | whisper.cpp Metal, `small` | 0.017 / 0.017 / 0.012 | 0.052 / 0.116 / 0.063 | 0.9 GB |
-  | mlx-whisper Apple GPU, `large-v3` | 0.064 / 0.065 / not run | 0.050 / 0.025 / not run | 3.9 GB |
+  | mlx-whisper Apple GPU, `large-v3` | 0.064 / 0.065 / 0.065 | 0.050 / 0.025 / 0.060 | 3.9 GB |
 
   The CPU baseline's batched VAD run dropped words in the Turkish clip (301 of 320 with turbo; its
   no-VAD run scores 0.034), which is why its VAD numbers are worse than the engines' without it. The
@@ -428,6 +430,10 @@ means. The sound map turns them into a timeline the agent reads as text. Researc
   (`sysctl hw.memsize`) in place of VRAM. The recommendation is `large-v3` from 16 GB,
   `large-v3-turbo` from 8 GB and `small` below; a warning appears when a model's peak plus 3 GB
   exceeds the memory.
+- **Known limitation (unverified):** MLX can abort the whole process when the Apple GPU runs out of
+  unified memory (an uncaught Metal error) instead of raising an error Python can handle, so such a
+  run would end without `ERROR:` and `HINT:`. Most likely with `large-v3` on an 8 GB Mac, which is
+  why `large-v3-turbo` is recommended there.
 - **Not done here:** the sound map on the Apple GPU (separate item in the roadmap), and a batched
   decoder (mlx-whisper decodes one 30 s window at a time and was already several times faster than
   the CPU).

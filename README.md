@@ -150,9 +150,12 @@ recommendation: you can choose any model, and `doctor` and `setup` warn when mem
 | Under 4 GB, or CPU mode | `small` | Much faster on the CPU; noticeably less accurate. 0.5 GB. |
 
 On an Apple Silicon Mac the unified memory decides instead: 16 GB or more → `large-v3`, 8 GB or
-more → `large-v3-turbo`, otherwise `small`. Measured on an M5 Pro with 24 GB: `large-v3` transcribes
-at about 0.1 min per minute of audio (an hour of video in about 6 minutes), `large-v3-turbo` at 0.03
-and `small` at 0.026, roughly 2.5 to 4 times faster than the same model on the Mac's CPU.
+more → `large-v3-turbo`, otherwise `small`. Measured by the contributor of the Apple GPU engine
+([@Bilaxten](https://github.com/Bilaxten)) on an M5 Pro with 24 GB and macOS 27, not reproduced by
+the maintainer: `large-v3` transcribes at about 0.1 min per minute of audio (an hour of video in
+about 6 minutes), `large-v3-turbo` at 0.03 and `small` at 0.026, roughly 2.5 to 4 times faster than
+the same model on the Mac's CPU. Known limitation (unverified): when MLX runs out of unified memory
+(most likely `large-v3` on an 8 GB Mac) it may abort the process instead of reporting an `ERROR:`.
 
 Valid models: `large-v3`, `large-v3-turbo`, `large-v2`, `medium`, `small`, `base`, `tiny`.
 
@@ -267,8 +270,8 @@ the file by hand. An invalid setting stops every command with an `ERROR:` and a 
 | Windows, NVIDIA GPU (CUDA) | Supported, full speed. Developed and measured on Windows 11 with an RTX 5060 Ti 16 GB. |
 | Linux, NVIDIA GPU (CUDA) | Supported. The CLI finds the CUDA libraries from its Python packages by itself. Verified on WSL (Arch Linux) with the `small` model; reports from native Linux welcome. |
 | Windows and Linux, CPU mode | Supported when chosen explicitly. Slow; use a small model. The sound map needs an NVIDIA GPU. |
-| macOS, Apple Silicon (M1 and later), Apple GPU | Supported through mlx-whisper (`device: auto`). Measured on an Apple M5 Pro with 24 GB; see [`docs/DESIGN.md`](docs/DESIGN.md#apple-silicon-engine). Frames work as everywhere; the sound map needs an NVIDIA GPU. Reports from other chips welcome. |
-| macOS, CPU mode | Supported when chosen explicitly (every Mac, including Intel): about 4 min per hour of audio with `small` on an M5 Pro. |
+| macOS, Apple Silicon (M1 and later), Apple GPU | Supported through mlx-whisper (`device: auto`). Measured by the contributor on an Apple M5 Pro with 24 GB; see [`docs/DESIGN.md`](docs/DESIGN.md#apple-silicon-engine). Frames work as everywhere; the sound map needs an NVIDIA GPU. Reports from other chips welcome. |
+| macOS, CPU mode | Supported when chosen explicitly on Apple Silicon (verified by the contributor: about 4 min per hour of audio with `small` on an M5 Pro). Expected to work, but unverified on Intel Macs: [reports welcome](https://github.com/AAyberkU/video-watch/issues/new?template=platform_support.yml). |
 | AMD and Intel GPUs | Not yet. [Help wanted](docs/help-wanted/amd-intel-gpu.md). |
 
 | Agent | Status |
